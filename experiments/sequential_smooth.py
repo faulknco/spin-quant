@@ -39,7 +39,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
 from src.codebook import quantize_blocks
-from src.hessian import estimate_h_diag, _ActivationCapture
+from src.hessian import estimate_h_diag
 from experiments.eval_perplexity import conv1d_to_linear, eval_perplexity
 
 
@@ -111,6 +111,8 @@ def build_all_layer_model(model, tokenizer, calib_texts, mode, block_dim, K):
             raw = getattr(block.mlp, attr)
             if mode == "flat":
                 layer = quantize_layer_flat(raw, block_dim, K)
+            # Sequential: by the time we reach c_proj, this block's c_fc is already quantized.
+            # This is intentional — c_proj calibration sees activations from the quantized c_fc.
             elif mode == "smooth":
                 # Sequential: use model (with already-quantized prior layers), not base_model.
                 # Use raw (live layer in model) for the hook — captures true inference activations.
@@ -171,12 +173,13 @@ def main():
     print(f"\n  Error accumulation (all-layer vs single-layer):")
     for label, ppl_all in results.items():
         ppl_single = SINGLE_LAYER.get(label, None)
-        if ppl_single:
+        if ppl_single is not None:
             factor = ppl_all / ppl_single
             exp12_val = EXP12_PPL["smooth bd=16 K=256 (indep)"]
             print(f"  single-layer: {ppl_single:.1f}  ->  all-layer: {ppl_all:.1f}  ({factor:.1f}x amplification)")
             print(f"  vs Exp 12 (indep):  {exp12_val:.1f}  ->  {ppl_all:.1f}  ({'BETTER' if ppl_all < exp12_val else 'WORSE'})")
-            print(f"  vs Exp 9  (flat):   3042.4  ->  {ppl_all:.1f}  ({'BETTER' if ppl_all < 3042.435 else 'WORSE'} than flat)")
+            exp9_val = EXP9_PPL["flat bd=16 K=256"]
+            print(f"  vs Exp 9  (flat):   {exp9_val:.1f}  ->  {ppl_all:.1f}  ({'BETTER' if ppl_all < exp9_val else 'WORSE'} than flat)")
 
 
 if __name__ == "__main__":
