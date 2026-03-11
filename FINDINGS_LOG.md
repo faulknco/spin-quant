@@ -496,7 +496,43 @@ Cap H_diag at the p-th percentile, preventing maximum scale amplification from
 exceeding clip_p/clip_min ratio. Sweep over clip percentiles to find where PPL
 and H-RMSE gain balance.
 
-**Status of fix:** Running sweep over clip_percentiles=[50, 75, 90, 95, 99, 100].
+**Clip sweep results:**
+```
+Flat k-means:          380.618   (delta +324.5)  ← reference
+H-weighted clip= 50%: 2865.209  ratio=1.8×
+H-weighted clip= 75%: 1275.376  ratio=1.9×
+H-weighted clip= 90%: 1055.158  ratio=2.4×  ← "best" but still 2.8× worse than flat
+H-weighted clip= 95%: 12269     ratio=3.2×  ← cliff
+H-weighted clip= 99%: 53941     ratio=5.5×
+H-weighted clip=100%: 4553      ratio=14.6×  ← original unclipped
+```
+
+**Critical observation: non-monotonic failure.**
+clip=50% (gentlest scaling, ratio=1.8×) gives PPL=2865, *worse* than clip=90% (ratio=2.4×).
+This non-monotonicity reveals that clipping is NOT the root problem.
+
+**Revised root cause: structural incompatibility between block layout and H_diag.**
+
+Every 16-dim block contains a mix of hot (H_diag≈0.99, scale≈1.0) and cold (H_diag≈0.005,
+scale≈0.07) dimensions. Any asymmetric weighting inside the block causes one group to dominate
+the centroid at the expense of the other:
+  - High scale (clip=100%): hot dims dominate → cold dims blow up on reconstruction
+  - Low scale (clip=50%):  hot dims artificially suppressed → hot dims poorly fit →
+    model output degraded because the important directions are poorly served
+
+There is no clip value that fixes both problems simultaneously. The block structure is the
+incompatibility: k-means operates on blocks, but sensitivity varies *within* each block.
+
+**Correct fix: sort input dimensions by H_diag before forming blocks.**
+
+If blocks contain dims of similar sensitivity, within-block scale ratio → 1.0.
+No blow-up, no suppression. The global H-ordering is preserved across blocks.
+This is the "sort spins by coupling strength before lattice quantization" approach.
+
+Physics analogy: in a frustrated lattice model, reordering sites so that similar-coupling
+spins are neighbours reduces frustration and allows the ground state to be found more easily.
+
+**Status: running sorted H-weighted experiment (Experiment 4b).**
 
 ---
 

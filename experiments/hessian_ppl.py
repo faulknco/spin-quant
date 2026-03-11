@@ -21,7 +21,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
 from src.codebook import quantize_blocks, reconstruct
-from src.hessian import estimate_h_diag, hessian_quantize, hessian_reconstruct
+from src.hessian import (estimate_h_diag, hessian_quantize, hessian_reconstruct,
+                         hessian_quantize_sorted, hessian_reconstruct_sorted)
 from experiments.eval_perplexity import conv1d_to_linear, eval_perplexity
 
 
@@ -118,49 +119,54 @@ def main():
     del model_flat
     print(f"  PPL = {ppl_flat:.3f}  (delta = +{ppl_flat - ppl_base:.3f})")
 
-    # --- H-weighted k-means: sweep clip percentiles
-    print(f"\n[3/3] H-weighted k-means sweep over clip percentiles ...")
-    print(f"      (clip_pct=100 → no clipping; lower → gentler scaling)")
+    # --- H-weighted sorted: sort dims by H_diag before blocking
+    print(f"\n[3/3] H-weighted sorted k-means (K={K}) ...")
+    print(f"      (dims sorted by H_diag so each block has uniform sensitivity)")
+    state_sorted = hessian_quantize_sorted(W, h_diag, BLOCK_DIM, K, n_iter=50)
 
-    hq_results = []
-    for clip_pct in CLIP_PERCENTILES:
-        state_hq = hessian_quantize(W, h_diag, BLOCK_DIM, K, n_iter=50,
-                                    scale_clip_percentile=clip_pct)
-        # effective max/min scale ratio after clipping
-        scale = state_hq["scale"]
-        scale_ratio = (scale.max() / scale.clamp(min=1e-8).min()).item()
+    # Measure within-block scale ratio to confirm uniformity
+    sort_idx = state_sorted["sort_idx"]
+    h_sorted = h_diag[sort_idx]
+    n_blocks_per_row = W.shape[1] // BLOCK_DIM
+    h_blocks = h_sorted.reshape(n_blocks_per_row, BLOCK_DIM)
+    within_block_ratios = (h_blocks.max(dim=1).values / h_blocks.min(dim=1).values.clamp(min=1e-8))
+    print(f"  Within-block H_diag ratio: mean={within_block_ratios.mean():.2f}×  "
+          f"max={within_block_ratios.max():.2f}×  (vs 214× global before sorting)")
 
-        hq_layer = _HessianLinear(
-            state_hq["centroids_scaled"],
-            state_hq["labels"],
-            state_hq["scale"],
-            W.shape, b,
-        )
-        model_hq = copy.deepcopy(model)
-        model_hq.transformer.h[0].mlp.c_fc = hq_layer
-        ppl_hq = eval_perplexity(model_hq, tokenizer, eval_texts, MAX_LEN, DEVICE)
-        del model_hq
+    class _SortedHLinear(nn.Module):
+        def __init__(self, state, bias=None):
+            super().__init__()
+            self.register_buffer("centroids", state["centroids"].float())
+            self.register_buffer("labels",    state["labels"])
+            self.register_buffer("unsort_idx", state["unsort_idx"])
+            self._W_shape = state["W_shape"]
+            self._bd = state["block_dim"]
+            self.bias = nn.Parameter(bias.clone().float()) if bias is not None else None
+        def forward(self, x):
+            out_f, in_f = self._W_shape
+            W_sorted = self.centroids[self.labels].reshape(out_f, in_f)
+            W = W_sorted[:, self.unsort_idx]
+            return F.linear(x, W, self.bias)
 
-        hq_results.append((clip_pct, scale_ratio, ppl_hq))
-        print(f"  clip={clip_pct:>3}%  scale_ratio={scale_ratio:>5.1f}×  PPL={ppl_hq:>9.3f}  "
-              f"(delta={ppl_hq-ppl_base:>+9.3f})")
+    sorted_layer = _SortedHLinear(state_sorted, b)
+    model_sorted = copy.deepcopy(model)
+    model_sorted.transformer.h[0].mlp.c_fc = sorted_layer
+    ppl_sorted = eval_perplexity(model_sorted, tokenizer, eval_texts, MAX_LEN, DEVICE)
+    del model_sorted
+    print(f"  PPL = {ppl_sorted:.3f}  (delta = +{ppl_sorted - ppl_base:.3f})")
 
     # --- Summary
-    best_clip, best_ratio, best_ppl = min(hq_results, key=lambda x: x[2])
     print(f"\n{'='*65}")
     print(f"PPL Summary  (single layer: h0.c_fc, K={K}, bpw=0.5)")
     print(f"{'='*65}")
     print(f"  Baseline (FP32):             {ppl_base:>9.3f}")
     print(f"  Flat k-means:                {ppl_flat:>9.3f}  (delta={ppl_flat-ppl_base:>+8.3f})")
-    for clip_pct, ratio, ppl_hq in hq_results:
-        marker = " ← best" if clip_pct == best_clip else ""
-        print(f"  H-weighted clip={clip_pct:>3}%:        {ppl_hq:>9.3f}  (delta={ppl_hq-ppl_base:>+8.3f})  "
-              f"ratio={ratio:.1f}×{marker}")
+    print(f"  H-weighted sorted:           {ppl_sorted:>9.3f}  (delta={ppl_sorted-ppl_base:>+8.3f})")
 
-    ppl_gain = ppl_flat - best_ppl
+    ppl_gain = ppl_flat - ppl_sorted
     ppl_gain_pct = ppl_gain / (ppl_flat - ppl_base) * 100 if ppl_flat > ppl_base else 0
-    print(f"\n  Best H-weighted (clip={best_clip}%) vs flat: {ppl_gain:+.3f}  "
-          f"({ppl_gain_pct:.1f}% of quantization gap recovered)")
+    print(f"\n  H-weighted sorted vs flat:   {ppl_gain:>+9.3f}  "
+          f"({ppl_gain_pct:.1f}% of quantization gap {'recovered' if ppl_gain > 0 else 'added'})")
 
 
 if __name__ == "__main__":

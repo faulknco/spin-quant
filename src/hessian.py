@@ -108,6 +108,66 @@ def estimate_h_diag(
 # Hessian-weighted k-means quantization
 # ---------------------------------------------------------------------------
 
+def hessian_quantize_sorted(
+    W: torch.Tensor,
+    h_diag: torch.Tensor,
+    block_dim: int,
+    K: int,
+    n_iter: int = 50,
+) -> dict:
+    """
+    H-weighted codebook quantization with dimension sorting.
+
+    Key insight: mixing hot (high H_diag) and cold (low H_diag) dimensions in the
+    same block causes any weighting scheme to serve one set at the expense of the
+    other. When blocks are reordered so each contains dims of similar sensitivity,
+    the within-block scale ratio is small and H-weighting is safe.
+
+    Physics analogy: sorting spins by coupling strength before lattice quantization —
+    like placing strongly-coupled spins on the same sublattice so the interaction
+    energy is bounded within each unit cell.
+
+    Steps:
+      1. Sort input dimensions by H_diag (ascending)
+      2. Form blocks of block_dim consecutive sorted dims (similar sensitivity per block)
+      3. Run standard k-means in sorted space (within-block H_diag is nearly constant)
+      4. Reconstruct and unsort back to original dimension order
+
+    Returns state dict including the sort_idx for reconstruction.
+    """
+    out_f, in_f = W.shape
+    assert in_f % block_dim == 0
+
+    # Sort dimensions by H_diag ascending
+    sort_idx   = h_diag.argsort()       # [in_f]  original → sorted position
+    unsort_idx = sort_idx.argsort()     # [in_f]  sorted → original position
+
+    # Reorder columns of W
+    W_sorted = W.float()[:, sort_idx]  # [out_f, in_f]  columns sorted by sensitivity
+
+    # Standard k-means on sorted blocks (within-block scale is nearly constant)
+    W_blocks = W_sorted.reshape(-1, block_dim).cpu()
+    centroids, labels = kmeans(W_blocks, K, n_iter=n_iter)
+
+    return {
+        "centroids":  centroids,   # [K, block_dim]
+        "labels":     labels,      # [N_blocks]
+        "sort_idx":   sort_idx,    # [in_f]  for reconstruction
+        "unsort_idx": unsort_idx,  # [in_f]
+        "block_dim":  block_dim,
+        "W_shape":    W.shape,
+    }
+
+
+def hessian_reconstruct_sorted(state: dict) -> torch.Tensor:
+    """Reconstruct from sorted H-weighted codebook."""
+    out_f, in_f = state["W_shape"]
+    W_sorted_blocks = state["centroids"][state["labels"]]
+    W_sorted = W_sorted_blocks.reshape(out_f, in_f)
+    # Unsort columns back to original dimension order
+    return W_sorted[:, state["unsort_idx"]]
+
+
 def hessian_quantize(
     W: torch.Tensor,
     h_diag: torch.Tensor,
