@@ -733,6 +733,82 @@ should significantly reduce total storage while maintaining PPL quality.
 
 ---
 
+## Experiment 9 — All-layer quantization
+
+**Hypothesis:** Single-layer PPL understates total quantization damage; accumulating errors
+across all 24 MLP layers will compound dramatically.
+
+**Design:** Quantize all 24 MLP layers (h0-h11 × c_fc, c_proj) simultaneously.
+3 configs: bpw=0.5 (K=256, bd=16), bpw=0.625 (K=1024, bd=16), bpw=1.0 (K=16, bd=4).
+100 eval texts; baseline PPL=59.640.
+
+**Results:**
+```
+Config                   single-layer PPL   all-layer PPL   amplification
+bpw=0.500 (K=256, bd=16)     381                3,042            9.3×
+bpw=0.625 (K=1024, bd=16)    100                3,726           90.9×
+bpw=1.000 (K=16,  bd=4)       71               19,571          1718×
+```
+
+### Key finding: all-layer PPL is NON-MONOTONE in bpw
+
+More bits (higher bpw) gives *worse* all-layer PPL. bpw=0.5 beats both 0.625 and 1.0.
+This is deeply counterintuitive — standard expectation is that more bits = less error = better PPL.
+
+**NLL amplification analysis (in log space):**
+```
+                      single-layer     all-layer    NLL amplification
+bpw=0.5:   Δ_NLL = 1.847 nats   →  3.924 nats     2.1×
+bpw=0.625: Δ_NLL = 0.511 nats   →  4.131 nats     8.1×
+bpw=1.0:   Δ_NLL = 0.168 nats   →  5.790 nats    34.5×
+```
+NLL amplification grows super-linearly with bpw. When per-layer error is large, the model
+is already broken and additional broken layers don't compound dramatically (saturation).
+When per-layer error is small, errors propagate multiplicatively through 24 layers (explosion).
+
+### Mechanisms
+
+**1. Residual stream saturation:**
+When one layer introduces large quantization errors (bpw=0.5), the residual connection
+carries those errors forward — but subsequent layers (all still FP32 in single-layer tests)
+can partially compensate. With ALL layers quantized, there's no FP32 "correction" available,
+but also no multiplicative cascade because the damage was already catastrophic at layer 1.
+
+**2. Structured error resonance (bpw=1.0, K=16, bd=4):**
+K=16 in 4D means only 16 unique 4-weight patterns for the entire layer. Each of the 590K
+blocks in one layer is drawn from only 16 templates. This creates highly structured, systematic
+errors. When EVERY layer has systematic errors (from its own 16-template codebook), the
+structured biases interact and compound multiplicatively — like structured noise in a DSP
+pipeline vs random noise. The 1718× amplification is the signature of this resonance.
+
+**3. Phase diagram non-monotonicity:**
+The (K=16, bd=4) config for bpw=1.0 is in the chaotic regime for individual layers
+(from Exp 8: bd=4, K=4 at bpw=0.5 gives single-layer PPL=483, barely stable).
+When stacked 24 deep, the marginally-stable individual layers produce catastrophic collective failure.
+The (K=256, bd=16) config for bpw=0.5 is AT the phase transition — right at the boundary
+between chaotic and ordered phases. Each individual layer is damaged but the errors are less
+structured (256 diverse centroids vs 16 repeated ones), averaging out better across layers.
+
+**Physics interpretation — coupled spin lattice:**
+In a 2D spin system with nearest-neighbor coupling, the phase transition temperature T_c
+depends on both single-spin noise AND inter-spin coupling strength. Near T_c, the correlation
+length diverges — a single "bad spin" affects many neighbours. Deep in the ordered phase
+(high bpw single-layer), the system is highly ordered but also highly correlated: a bad spin
+can propagate its error through the entire correlation length (all 24 layers).
+Near T_c (bpw=0.5 single-layer), the correlation length is small — bad spins affect only
+local neighbours. The all-layer error is thus SMALLEST near the single-layer phase transition.
+
+**Practical implication:**
+For all-layer quantization, the optimal bpw is NOT the highest you can afford — it's the
+bpw at the single-layer phase transition (≈0.5 for this architecture). Using more bits
+per weight (bpw>0.5) actually makes the all-layer model worse if the (K, bd) choice is
+poorly matched to the all-layer error accumulation structure.
+
+Better strategy: use bd=8, K=16 at bpw=0.5 (from Exp 8: single-layer PPL=165, better
+than bd=16's PPL=360) — expect lower all-layer PPL due to better single-layer error quality.
+
+---
+
 ## Experiment 8 — Block_dim effect on critical bpw
 
 **Hypothesis:** Smaller block_dim (more blocks, smaller K per block) might lower the critical bpw.
