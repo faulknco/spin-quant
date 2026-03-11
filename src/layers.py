@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from .codebook import quantize_blocks, reconstruct
 from .physics import on_quantize, on_reconstruct, rg_quantize, rg_reconstruct
 from .frequency import dct_quantize, dct_reconstruct, wht_quantize, wht_reconstruct
+from .spectral import svd_quantize, svd_reconstruct
 
 
 class CodebookLinear(nn.Module):
@@ -197,6 +198,60 @@ class FreqLinear(nn.Module):
         else:
             state["H"] = self.H
             return wht_reconstruct(state)
+
+    def forward(self, x):
+        return F.linear(x, self.dequantize(), self.bias)
+
+
+class SVDLinear(nn.Module):
+    """
+    SVD spectral quantization.
+
+    Physics framing:
+      W = U @ diag(S) @ V^T is the spectral decomposition of the weight operator.
+      Singular values S decay fast → keeping top-r modes captures most of W's action.
+      Analogous to keeping the dominant eigenmodes of a Hamiltonian.
+
+    Storage: U_r [m,r] + S_r [r] + V_r [n,r], all scalar-quantized.
+    bpw ≈ r*(m+n)*log2(K_UV) / (m*n)  which → 0 for small r.
+    """
+
+    def __init__(self, in_features, out_features, state: dict, bias=None):
+        super().__init__()
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.register_buffer("U_idx",  state["U_idx"])
+        self.register_buffer("S_idx",  state["S_idx"])
+        self.register_buffer("Vh_idx", state["Vh_idx"])
+        self._U_min  = state["U_min"];   self._U_range  = state["U_range"]
+        self._S_min  = state["S_min"];   self._S_range  = state["S_range"]
+        self._Vh_min = state["Vh_min"];  self._Vh_range = state["Vh_range"]
+        self._n_UV   = state["n_levels_UV"]
+        self._n_S    = state["n_levels_S"]
+        self._rank   = state["rank"]
+        self._W_shape = state["W_shape"]
+        if bias is not None:
+            self.bias = nn.Parameter(bias.clone().float())
+        else:
+            self.bias = None
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, rank: int,
+                    n_levels_UV: int = 256, n_levels_S: int = 65536):
+        state = svd_quantize(linear.weight.data, rank=rank,
+                             n_levels_UV=n_levels_UV, n_levels_S=n_levels_S)
+        bias = linear.bias.data if linear.bias is not None else None
+        return cls(linear.in_features, linear.out_features, state, bias)
+
+    def dequantize(self) -> torch.Tensor:
+        state = {
+            "U_idx": self.U_idx, "U_min": self._U_min, "U_range": self._U_range,
+            "S_idx": self.S_idx, "S_min": self._S_min, "S_range": self._S_range,
+            "Vh_idx": self.Vh_idx, "Vh_min": self._Vh_min, "Vh_range": self._Vh_range,
+            "n_levels_UV": self._n_UV, "n_levels_S": self._n_S,
+            "rank": self._rank, "W_shape": self._W_shape,
+        }
+        return svd_reconstruct(state)
 
     def forward(self, x):
         return F.linear(x, self.dequantize(), self.bias)

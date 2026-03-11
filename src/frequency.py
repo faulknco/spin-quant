@@ -162,7 +162,7 @@ def dct_reconstruct(state: dict) -> torch.Tensor:
     coeffs_q[:, :keep_k] = kept_q
 
     W_blocks = idct1d(coeffs_q)
-    return W_blocks.view(state["W_shape"])
+    return W_blocks.reshape(state["W_shape"])
 
 
 # ---------------------------------------------------------------------------
@@ -251,4 +251,4 @@ def wht_reconstruct(state: dict) -> torch.Tensor:
     coeffs_q[:, :keep_k] = kept_q
 
     W_blocks = coeffs_q @ H   # inverse WHT = H itself (H is orthonormal)
-    return W_blocks.view(state["W_shape"])
+    return W_blocks.reshape(state["W_shape"])
