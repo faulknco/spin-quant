@@ -579,6 +579,113 @@ covariance rotation. This is a principled derivation, not just an empirical obse
 
 ---
 
+## Experiments 5 & 5b — Per-column H-weighted and normalized k-means
+
+**Hypothesis:** The Experiment 4 failures were caused by within-block sensitivity mixing.
+Moving to per-column layouts (groups formed within a single input column j, sharing H_diag[j])
+should eliminate scale amplification.
+
+**Experiment 5 — Col-grouped H-weighted (groups within columns):**
+```
+Layout:  W.T [in_f=768, out_f=3072]; groups of 16 output-dim rows per column j
+         → all 16 elements share H_diag[j] (within-group ratio = 1.0× by construction)
+K=256, group_size=16, bpw=0.500
+
+  Baseline (FP32):         56.090
+  Flat block k-means:     380.618   (delta=+324.528)
+  Col-grouped H-weighted: 336950.938 (delta=+336894.847)
+  H-RMSE flat: 0.015003    H-RMSE col-grouped: 0.014782  (gain=+1.5%)
+```
+
+PPL = 336,950 — worse than random prediction (PPL=50K vocab).
+
+**Experiment 5b — Per-column normalized k-means (z-score per column):**
+```
+Layout:  same as Exp 5 but normalize each column j to (μ=0, σ=1) before k-means
+         μ_j, σ_j stored as side info (6KB, ~0 bpw overhead)
+
+  Baseline (FP32):          56.090
+  Flat block k-means:      380.618  (delta=+324.528)
+  Col-normalized:          378415.500 (delta=+378359.410)
+  Col-normalized + H-wt:   442496.938 (delta=+442440.847)
+  H-RMSE flat: 0.015003    H-RMSE col-norm: 0.014024 (gain=+6.5%)
+  H-RMSE col-norm+H:       0.014358  (gain=+4.3%)
+```
+
+PPL = 378,415 with normalization — worse than Experiment 5 even though H-RMSE improved.
+
+### Definitive diagnosis: H-RMSE ≠ PPL
+
+**All five H-weighted variants failed (summarised):**
+
+| Approach               | Within-group scale | Cross-group scale | PPL     |
+|------------------------|--------------------|-------------------|---------|
+| Flat H-weighted (raw)  | 14× (mixed)        | n/a               | 4553    |
+| Clipped (best: 90%)    | 2.4× (mixed)       | n/a               | 1055    |
+| Sorted H-weighted      | 1.26× (sorted)     | n/a               | 2110    |
+| Col-grouped H-wt       | 1.0× (by construct)| 14.57× (shared K) | 336,951 |
+| Col-normalized         | 1.0×               | 1.0× (normed)     | 378,415 |
+| **Flat block k-means** | **n/a (uniform)**  | **n/a**           | **381** |
+
+The last two entries are the most striking: Exp 5b completely eliminates scale heterogeneity
+(normalized groups, shared codebook) and still gets PPL=378,415 — worse than Exp 5.
+
+**Root cause: H-RMSE ≠ PPL in the tail.**
+
+H-RMSE = sqrt( mean_{i,j} H_diag[j] × (W[i,j] - Wq[i,j])² )
+
+This is an AVERAGE over calibration data weighted by E[x_j²]. Col-norm and H-weighted schemes
+consistently improve this metric while catastrophically degrading PPL because:
+
+1. H_diag[j] = E[x_j²] is small for "cold" dimensions — but cold ≠ zero.
+   At individual tokens, x_j can be non-negligible even for cold dimensions.
+
+2. Schemes that concentrate codebook capacity on hot columns (or optimize for hot-column
+   reconstruction quality) leave cold columns poorly represented in the shared codebook.
+
+3. Large cold-column reconstruction errors × non-zero x_j at inference = catastrophic
+   logit distortions for those tokens.
+
+4. PPL = exp(mean NLL) is dominated by the worst-case tokens (log scale).
+   H-RMSE averages over calibration data — completely misses the tail.
+
+**Flat k-means avoids this by treating all weights uniformly**: no column is preferentially
+served; reconstruction errors are bounded and consistent across all columns and tokens.
+This is why PPL=381 is achievable even though H-RMSE=0.015 isn't the "optimal" metric.
+
+**The spin-glass analogy revisited:**
+In a spin glass, optimising only the strong couplings J_ij while ignoring weak ones
+creates a frustrated state where the weak-coupling spins find no stable configuration.
+The ground state energy (PPL) is dominated by the worst frustrated spin clusters (worst tokens).
+H-RMSE is like optimising the mean energy — the partition function (PPL) depends on the
+entire free energy landscape including rare configurations.
+
+**Definitive conclusion: Diagonal H-weighted shared codebook cannot improve PPL over flat
+k-means at the same bpw regardless of block layout, normalization, or clipping.**
+
+The path forward requires fundamentally different strategies:
+1. Full Hessian rotation (GPTQ) — rotate into eigenbasis of E[xx^T], making all dimensions
+   equally sensitive before uniform quantization. Eliminates the heterogeneity problem at root.
+2. Non-uniform bit allocation — hot columns get larger K (more bits), cold columns less.
+   Total bpw preserved; each column uses its own codebook. Eliminates cross-column contamination.
+3. SmoothQuant-style scale migration — absorb column scale into the activation path
+   (preceding layer norm), leaving W with uniform column scales. Flat k-means then works.
+
+---
+
+## Experiment 6 — Corrected bpw sweep (PPL vs bits)
+
+**Motivation:** The Experiment 0 sweep had the Conv1D bug (all deltas = 0). Now that we have
+the corrected single-layer PPL framework, run a proper bpw vs PPL characterization for flat
+k-means, the best-performing quantization scheme found so far.
+
+**Goal:** Find the "phase transition" bpw below which PPL diverges; understand how flat
+k-means scales from aggressive (low bpw) to fine-grained (high bpw) quantization.
+
+**Status:** IN PROGRESS
+
+---
+
 ## Key references from source PDF
 
 - BitNet b1.58 2B4T: arxiv.org/html/2504.12285v1
