@@ -823,6 +823,34 @@ The catastrophic spike at α=0.4 (PPL=1334) adjacent to the optimal α=0.5 (PPL=
 
 ---
 
+## Experiment 11 — SmoothQuant + block_dim combination
+
+**Question:** Do SmoothQuant (Exp 10) and optimal bd=8 (Exp 8) improvements combine?
+
+**Results:**
+```
+(A) Flat,    bd=16, K=256: PPL=380.618  (reference)
+(B) Flat,    bd=8,  K=16:  PPL=154.340  ← BEST — 69.7% gap recovery
+(C) Smooth,  bd=16, K=256: PPL=169.704  — 65.0% gap recovery
+(D) Smooth,  bd=8,  K=16:  PPL=271.470  — 33.6% (WORSE than B or C alone)
+```
+
+**Finding: improvements do NOT combine.** Config D (both) is worse than either alone.
+
+**Why:** bd=8 was optimized for the *original* weight distribution of h0.c_fc. SmoothQuant
+scales W_smooth = W / col_scale (4.91× column ratio), fundamentally changing the block
+distribution. The within-row correlation structure that made bd=8 optimal for W is different
+for W_smooth — and bd=16 is again better for the scaled weights.
+
+The two techniques address the same underlying problem (column scale heterogeneity) from
+different angles: bd=8 exploits weight correlation structure at the unscaled level;
+SmoothQuant removes scale heterogeneity before flat bd=16 k-means. Combining both
+over-corrects and falls into a worse quantization configuration.
+
+**Best single-layer result at bpw=0.5:** bd=8, K=16 (no scaling), PPL=154 (70% gap recovery).
+
+---
+
 ## Experiment 9 — All-layer quantization
 
 **Hypothesis:** Single-layer PPL understates total quantization damage; accumulating errors
