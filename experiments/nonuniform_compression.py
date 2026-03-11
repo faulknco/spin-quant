@@ -94,14 +94,20 @@ class _ReconLinear(nn.Module):
 
 
 def quantize_per_row(W, b, block_dim, K):
-    """Per-row k-means: one codebook per output row."""
+    """Per-row k-means: one codebook per output row.
+
+    K is capped at n_blocks_per_row (= in_features // block_dim) since k-means
+    requires K <= N. For c_fc layers (in_features=768, bd=8): max K=96.
+    For c_proj layers (in_features=3072, bd=8): max K=384.
+    """
     W = W.float().cpu()
     out_f, in_f = W.shape
     n_blocks = in_f // block_dim
+    K_eff = min(K, n_blocks)  # cap at n_blocks_per_row
     W_q = torch.zeros_like(W)
     for i in range(out_f):
         row_blocks = W[i].reshape(n_blocks, block_dim)
-        centroids_i, labels_i = kmeans(row_blocks, K, n_iter=50, seed=42)
+        centroids_i, labels_i = kmeans(row_blocks, K_eff, n_iter=50, seed=42)
         W_q[i] = centroids_i[labels_i].reshape(in_f)
     return _ReconLinear(W_q, b)
 
