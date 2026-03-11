@@ -823,6 +823,64 @@ The catastrophic spike at α=0.4 (PPL=1334) adjacent to the optimal α=0.5 (PPL=
 
 ---
 
+## Experiment 19A — Data-driven non-uniform compression
+
+**Question:** Can we improve all-layer PPL by reallocating bits budget-neutrally —
+more K for the top-N most-sensitive layers (by Exp 18 ΔPPL ranking), less for the rest?
+
+**Design:** `experiments/nonuniform_compression.py`. Uses Exp 18 per-layer ΔPPL
+rankings (per-row K=64) to define "sensitive" vs "background" sublayers. For each
+config (N_sensitive, K_high, K_low), all 24 sublayers are quantized with per-row
+k-means using their assigned K. K is capped at n_blocks_per_row (96 for c_fc, 384 for
+c_proj). Config "top-8 K256/K32" is exactly budget-neutral at 0.75 bpw. Baseline:
+uniform K=64 all-layer (Exp 17C/18) PPL = 439.7.
+
+| Config                    |  N | K_h | K_l |   bpw |      PPL | vs K=64 |
+|---------------------------|---:|----:|----:|------:|---------:|--------:|
+| Uniform K=64              |  — |  64 |  64 | 0.750 |    439.7 | 1.000×  |
+| Uniform K=128             |  — | 128 | 128 | 0.875 |     87.6 | 0.199×  |
+| top-4  K256/K32           |  4 | 256 |  32 | 0.688 |  1,655.1 | 3.764×  |
+| top-8  K256/K32 (=0.75bpw)|  8 | 256 |  32 | 0.750 |  1,340.3 | 3.048×  |
+| top-8  K128/K32           |  8 | 128 |  32 | 0.708 |  1,532.2 | 3.484×  |
+| top-12 K128/K32           | 12 | 128 |  32 | 0.750 |    985.1 | 2.240×  |
+| top-4  K128/K64           |  4 | 128 |  64 | 0.771 |    288.9 | 0.657×  |
+
+FP32 baseline: 63.278. Note: K capped at 96 for c_fc layers in K_high=256/128 configs.
+
+**Key finding: non-uniform compression with K_low=32 catastrophically fails.**
+
+Every config that drops background layers to K=32 is 2–4× *worse* than uniform K=64,
+even the budget-neutral "top-8 K256/K32" at identical bpw=0.75. Only "top-4 K128/K64"
+(which keeps background at K=64) beats the baseline — by 34% — but at higher bpw=0.771.
+
+**Mechanism: K=32 is below the single-layer threshold for many layers.**
+
+From Exp 17B, per-row K=32 all-layer PPL = 2,841. Dropping 16 background layers to K=32
+pushes them into a high-error regime. The damage from those 16 underserved layers far
+outweighs the benefit of giving 4–12 sensitive layers more K. The residual stream (Exp 18)
+propagates every layer's error additively to the final checkpoint — there is no recovery.
+
+**Uniform K=128 is the star result: PPL=87.6 (5× better than K=64, 0.875 bpw).**
+
+The massive jump from K=64 (PPL=440) to K=128 (PPL=88) — a 5× improvement for just
+0.125 bpw extra — suggests the per-row scheme has a second critical transition near K=64.
+Below K=64: moderate quality (PPL ~440). Above K=64: near-FP32-quality possible. This is
+analogous to the phase transition at K=16→32 seen in Exp 16 for single-layer per-row.
+
+**Implication: the K=64 floor is inviolable.**
+
+The correct strategy for non-uniform compression is: boost sensitive layers above K=64
+while keeping background at K_min=64. Never sacrifice background quality below K=64.
+The "top-4 K128/K64" result (289 PPL) confirms this — 34% better than uniform K=64 at
+only +0.021 bpw overhead, with no layer dropping below K=64.
+
+The natural next experiment: sweep "top-N K128/K64" with N=4, 8, 12, 16 — all keeping
+background at K=64 — to find the optimal N at a fixed bpw budget. Also: test
+"top-4 K96/K64" (using the true c_fc max) to isolate the contribution of c_proj's
+extra K headroom.
+
+---
+
 ## Experiment 19B — Activation-calibrated per-row k-means
 
 **Question:** Does weighting k-means by FP32 input activation magnitudes reduce
