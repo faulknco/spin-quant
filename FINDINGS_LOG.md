@@ -343,6 +343,125 @@ improves the *right* metric (loss-weighted) by ~8% at no extra storage cost.
 
 ---
 
+---
+
+## Extended discussion — what the results mean together
+
+### The null results are as informative as the positive ones
+
+We tested three natural physics-inspired decompositions:
+  - **DCT/Fourier** (momentum-space truncation): flat spectrum → weights have no spatial frequency structure
+  - **SVD** (eigenmode truncation): α≈0.5 Marchenko-Pastur bulk → weights have no exploitable low-rank structure
+  - **Hessian diagonal** (sensitivity weighting): CV=2.336, gain 3.9–9.0% → real but moderate effect
+
+Together these paint a coherent picture: **GPT-2 base weights are high-rank, spatially incoherent,
+but non-uniformly sensitive to perturbation.** The structure is not in W itself but in how W
+interacts with the data distribution — i.e., in the loss landscape geometry.
+
+### Why Marchenko-Pastur α≈0.5 matters
+
+The Marchenko-Pastur distribution is the limiting spectral distribution of large random matrices
+with iid entries. Finding α≈0.5 uniformly across all 24 layers is not a coincidence — it is a
+signature of how SGD training works:
+
+- SGD adds gradient noise proportional to the batch variance
+- Over many steps this noise acts like random perturbations to the weights
+- The weights converge to a distribution where the task-relevant signal sits above a
+  "noise floor" consistent with the Marchenko-Pastur bulk
+
+This is analogous to **thermal equilibration** in statistical mechanics: a system in contact with
+a heat bath (the stochastic gradient noise) equilibrates to the Boltzmann distribution, which for
+a quadratic Hamiltonian is Gaussian — and Gaussian random matrices have Marchenko-Pastur spectra.
+
+**Implication:** The "task information" in GPT-2 is NOT stored in a small number of dominant
+singular modes. It is distributed across essentially all modes — a fundamentally delocalized
+representation. This is why compression is hard and why you need more bits than you might expect.
+
+### The Hessian gain mechanism
+
+The 7.7% gain at K=256 comes from a simple geometric argument:
+
+Flat k-means places 256 centroids to minimise the average squared distance from any weight block
+to its nearest centroid. In 16-dimensional space this is an optimal packing problem — the 256
+centroids tile the space uniformly.
+
+But the *loss function* doesn't care uniformly about all dimensions. Dimension j costs
+H_diag[j] × ε² to misquantize by ε. So the loss-optimal placement of centroids should be
+denser near the high-H_diag dimensions (the ~5-6 outlier dimensions with max activation
+energy 0.99 vs mean 0.022).
+
+H-weighted k-means achieves this by scaling the space before running k-means: in the scaled
+space, centroids pack uniformly, but when unscaled this corresponds to denser packing in
+the sensitive directions. This is geometrically identical to placing more centroids per unit
+volume in the high-curvature directions of the loss landscape.
+
+The gain grows with K because:
+- At K=16: only 16 centroids in 16D space → only 1 centroid per dimension on average,
+  so reallocation gains nothing; the error is dominated by coarse discretization everywhere
+- At K=256: finer coverage → reallocation of even 1-2 centroids toward hot dimensions matters
+- At K=1024: finer still → more opportunity for selective concentration
+
+Extrapolating: at K=4096 we'd expect gain ≈ 12-14%, plateauing because H_diag is diagonal
+(we're not accounting for inter-weight correlations). Full GPTQ with off-diagonal Hessian
+likely achieves 20-30% gain by also rotating the quantization axes to align with the
+loss Hessian eigenvectors — not just scaling.
+
+### Connection to GPTQ and the full spin-glass treatment
+
+Our diagonal H_diag approach is a first-order approximation to what GPTQ does:
+
+| Step | Our approach | GPTQ |
+|------|-------------|------|
+| Hessian estimation | H_diag[j] = E[x_j²] (diagonal only) | Full H = E[xx^T] (n×n matrix) |
+| Quantization | k-means in H^{1/2}-scaled space | Greedy column-by-column with error feedback |
+| Error propagation | None — blocks quantized independently | Quantization error in column j is propagated to remaining columns |
+| Gain vs flat | ~8% H-RMSE reduction | ~20-30% PPL reduction (literature) |
+
+In the spin-glass framing, our approach finds the ground state of a *diagonal* spin glass
+(no inter-site coupling). GPTQ finds the approximate ground state of the full coupled system
+using a Cholesky-based greedy solver — equivalent to one step of belief propagation on the
+full coupling graph.
+
+The next natural experiment is to ask: **is the off-diagonal H actually low-rank?**
+If E[xx^T] ≈ U Λ U^T with small rank, we can rotate into the Hessian eigenbasis cheaply,
+apply diagonal scaling in that basis, and approximate the full GPTQ gain at much lower cost.
+This is the "spectral Hessian" idea — the real synthesis of SVD and Hessian approaches.
+
+### Roadmap going forward
+
+**Tier 1 — immediate experiments (single layer, fast):**
+1. PPL eval: flat k-means vs H-weighted k-means (single layer swap) — IN PROGRESS
+2. H_diag rank analysis: is E[xx^T] actually low-rank? What is its effective rank?
+3. Calibration data scaling: does more calibration data sharpen H_diag and increase the gain?
+
+**Tier 2 — new schemes (medium effort):**
+4. Spectral Hessian: quantize in eigenbasis of E[xx^T], apply diagonal scaling there
+5. Per-layer bit allocation (RG flow): assign K based on per-layer H-RMSE sensitivity
+6. H-weighted RG: combine hierarchical codebook with Hessian scaling
+
+**Tier 3 — architecture experiments (high effort):**
+7. Replicate on LLaMA/Mistral: test α≈0.5 universality on a proper instruction-tuned model
+8. MPS decomposition: implement and test bond-dimension vs K tradeoff
+9. Full GPTQ-style error propagation on top of H-weighted codebook
+
+---
+
+## Experiment 4 — Hessian PPL evaluation [IN PROGRESS]
+
+**Hypothesis:** The 7.7% H-RMSE gain from Hessian weighting translates to measurable
+perplexity improvement when a single layer is quantized.
+
+**Design:**
+- Single layer: h0.c_fc only (to avoid memory pressure)
+- 3 conditions: baseline (FP32), flat k-means K=256, H-weighted k-means K=256
+- Calibration: 100 texts from WikiText-2 train split
+- Evaluation: 100 texts from WikiText-2 test split, max_length=128
+- Metric: perplexity (exp of mean NLL)
+
+**Status:** Running.
+
+---
+
 ## Key references from source PDF
 
 - BitNet b1.58 2B4T: arxiv.org/html/2504.12285v1
