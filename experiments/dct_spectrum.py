@@ -95,11 +95,9 @@ def rmse_sweep(W: torch.Tensor, block_dim: int = BLOCK_DIM):
             results.append(("WHT", keep_k, bpw, rmse))
 
     # Scalar codebook baseline: vary K for comparable bpw
-    # bpw = log2(K) / block_dim  →  K = 2^(bpw * block_dim)
-    for K in [4, 16, 64, 256, 1024, 4096, 16384, 65536]:
+    # Cap K at 4096 to avoid OOM (K=65536 needs ~90GB distance matrix)
+    for K in [4, 16, 64, 256, 1024, 4096]:
         bpw = math.log2(K) / block_dim
-        if bpw > 10:
-            break
         centroids, labels, _ = quantize_blocks(W, block_dim, K, n_iter=30)
         Wq = reconstruct(centroids, labels, W.shape)
         rmse = (W.float().cpu() - Wq).pow(2).mean().sqrt().item()
