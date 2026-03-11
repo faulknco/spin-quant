@@ -733,6 +733,76 @@ should significantly reduce total storage while maintaining PPL quality.
 
 ---
 
+## Experiment 10 — SmoothQuant-style scale migration ← BREAKTHROUGH
+
+**Hypothesis:** Migrating the per-column scale to the activation path (applying it to x at
+inference time rather than dividing the quantized weight on reconstruction) avoids the
+amplification failure mode, while preserving the ability to concentrate centroid capacity
+on important dimensions.
+
+**Key difference from Experiments 4/5:** In those experiments, the H_diag scale was
+absorbed into the weight reconstruction step → amplified errors. Here, the scale is
+applied to the activation x in the forward pass: `F.linear(x * s, W_smooth, bias)`.
+W_smooth[:,j] = W[:,j] / s_j is what the flat k-means operates on (in row-major blocks
+— preserving within-row weight correlation). The scale never appears in reconstruction.
+
+**Design:**
+- Target: h0.c_fc, K=256, bd=16, bpw=0.5
+- 3 scaling strategies: W-std (s_j = std(W[:,j])), H-diag (s_j = sqrt(H_diag[j])),
+  Combined (s_j = std_j^0.5 × H_j^0.25 — geometric mean, α=0.5 as in SmoothQuant paper)
+- Flat k-means on W_smooth (row-major blocks — keeps within-row correlation structure)
+- Forward: F.linear(x * s, W_smooth_quant, bias)
+- 100 calib texts (for H_diag), 150 eval texts
+
+**Results:**
+```
+Variant                    col ratio   PPL       H-RMSE    vs flat baseline
+Flat k-means (baseline)    1.00×       380.618   0.015003  ref
+W-std scaling              3.06×       960.081   0.014711  -152.2% (worse)
+H-diag scaling             14.57×     1097.378   0.024394  -188.3% (worse)
+Combined (α=0.5)           4.91×       169.704   0.016759  +55.4%  ← WINNER
+Full precision             —            56.090   —
+```
+
+**FIRST POSITIVE RESULT: Combined SmoothQuant gives PPL=169.7 — 55% better than flat k-means at identical bpw=0.5.**
+
+### Mechanism analysis
+
+**Why W-std and H-diag scalings fail:**
+In the smooth weight space, W_smooth[:,j] = W[:,j] / s_j. Cold dims have small s_j, so
+their smooth-space values are amplified. The flat k-means (operating on smooth W) allocates
+centroids toward amplified cold-smooth values, leaving hot dims under-represented.
+
+Forward error: x_j × s_j × ΔW_smooth[:,j]
+- H-diag: s_j = sqrt(H_j). Cold dims: s_j ≈ 0.07, smooth-amplification 14.57×
+  → centroids concentrated on cold dims → hot dims get large ΔW_smooth
+  → error = x_j(large) × s_j(1.0) × ΔW_smooth(large) → catastrophic
+
+**Why combined scaling (α=0.5) works:**
+s_j = std_j^0.5 × H_j^0.25. Col ratio = 4.91× (vs 14.57× for H-diag alone).
+At 4.91×, both hot and cold dims get adequate centroid coverage. The geometric mean
+prevents the extremes that cause centroid concentration in either pure strategy.
+
+For both hot and cold dims, the output error x_j × s_j × ΔW_smooth is bounded:
+- Hot dims (large x_j, moderate s_j): adequate centroid coverage → small ΔW_smooth
+- Cold dims (small x_j, small s_j): even if ΔW_smooth is larger, x_j × s_j is small
+
+**H-RMSE metric is again misleading:**
+H-diag gives H-RMSE=0.024 (66% WORSE than baseline), yet PPL is also catastrophic.
+Combined gives H-RMSE=0.017 (13% worse than baseline), yet PPL is 55% better.
+The H-RMSE metric is structurally incapable of predicting SmoothQuant performance because
+the scale is now in the activation path, not the weight space.
+
+**Connection to original SmoothQuant paper:**
+SmoothQuant (Xiao et al., 2022) uses s_j = max(|X[:,j]|)^α / max(|W[j,:]|)^(1-α) with α=0.5.
+Our combined scale is s_j = std(W[:,j])^0.5 × sqrt(H_diag[j])^0.5, which uses the same
+α=0.5 geometric mean principle. The col ratio 4.91× matches the "migration balance" that
+makes both activation and weight quantization tractable simultaneously.
+
+**α=0.5 is not necessarily optimal — next experiment: α sweep.**
+
+---
+
 ## Experiment 9 — All-layer quantization
 
 **Hypothesis:** Single-layer PPL understates total quantization damage; accumulating errors
