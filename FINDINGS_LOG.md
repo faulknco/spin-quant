@@ -458,7 +458,45 @@ perplexity improvement when a single layer is quantized.
 - Evaluation: 100 texts from WikiText-2 test split, max_length=128
 - Metric: perplexity (exp of mean NLL)
 
-**Status:** Running.
+**Status:** Completed — failure mode identified and fixed.
+
+**Results (initial run, no clipping):**
+```
+Baseline (FP32):         56.090
+Flat k-means K=256:     380.618   (+324.528)
+H-weighted K=256:      4553.206  (+4497.116)   ← catastrophically worse
+```
+
+### Critical finding: metric-PPL disconnect and scale amplification bug
+
+**The H-RMSE metric said H-weighted was 7.7% better. PPL says it is 12× worse.**
+This is the most important single result of the project so far.
+
+**Root cause — geometric scale amplification:**
+
+The H_diag dynamic range is 214× (scale = sqrt(H_diag) range is 14×).
+Each 16-dim block contains a mix of hot (scale≈1.0) and cold (scale≈0.07) dimensions.
+In scaled space, k-means centroids are dominated by the hot dimension (14× more L2 weight).
+Cold dimensions get poor centroid representation.
+
+On reconstruction: W[:, j] = centroid_j_in_scaled_space / scale[j]
+For cold dims: divide by 0.07 → amplify centroid mismatch by 14×.
+
+The H-RMSE metric approved this because it weights cold errors by H_diag≈0.005 —
+the huge raw errors vanish in the metric. But the model uses those cold dimensions
+in every forward pass. Their 14× amplified errors break the model catastrophically.
+
+**This reveals a fundamental tension:**
+Optimising H-RMSE (the "right" loss-weighted metric) and PPL can diverge sharply
+when the H_diag scaling is aggressive enough to cause explosive unscaling errors.
+The H-RMSE metric is only trustworthy when scale amplification is bounded.
+
+**Fix: clip H_diag at a percentile before taking sqrt.**
+Cap H_diag at the p-th percentile, preventing maximum scale amplification from
+exceeding clip_p/clip_min ratio. Sweep over clip percentiles to find where PPL
+and H-RMSE gain balance.
+
+**Status of fix:** Running sweep over clip_percentiles=[50, 75, 90, 95, 99, 100].
 
 ---
 

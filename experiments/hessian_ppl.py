@@ -33,6 +33,10 @@ N_EVAL      = 150
 MAX_LEN     = 128
 DEVICE      = "cpu"
 
+# Clip percentiles to sweep — controls max scale amplification
+# 100 = no clipping (original, catastrophic), 50 = very gentle
+CLIP_PERCENTILES = [50, 75, 90, 95, 99, 100]
+
 
 # ---------------------------------------------------------------------------
 # Minimal drop-in layers (self-contained, no import chain issues)
@@ -114,34 +118,49 @@ def main():
     del model_flat
     print(f"  PPL = {ppl_flat:.3f}  (delta = +{ppl_flat - ppl_base:.3f})")
 
-    # --- H-weighted k-means
-    print(f"\n[3/3] Hessian-weighted k-means (K={K}) ...")
-    state_hq = hessian_quantize(W, h_diag, BLOCK_DIM, K, n_iter=50)
-    hq_layer = _HessianLinear(
-        state_hq["centroids_scaled"],
-        state_hq["labels"],
-        state_hq["scale"],
-        W.shape, b,
-    )
+    # --- H-weighted k-means: sweep clip percentiles
+    print(f"\n[3/3] H-weighted k-means sweep over clip percentiles ...")
+    print(f"      (clip_pct=100 → no clipping; lower → gentler scaling)")
 
-    model_hq = copy.deepcopy(model)
-    model_hq.transformer.h[0].mlp.c_fc = hq_layer
-    ppl_hq = eval_perplexity(model_hq, tokenizer, eval_texts, MAX_LEN, DEVICE)
-    del model_hq
-    print(f"  PPL = {ppl_hq:.3f}  (delta = +{ppl_hq - ppl_base:.3f})")
+    hq_results = []
+    for clip_pct in CLIP_PERCENTILES:
+        state_hq = hessian_quantize(W, h_diag, BLOCK_DIM, K, n_iter=50,
+                                    scale_clip_percentile=clip_pct)
+        # effective max/min scale ratio after clipping
+        scale = state_hq["scale"]
+        scale_ratio = (scale.max() / scale.clamp(min=1e-8).min()).item()
+
+        hq_layer = _HessianLinear(
+            state_hq["centroids_scaled"],
+            state_hq["labels"],
+            state_hq["scale"],
+            W.shape, b,
+        )
+        model_hq = copy.deepcopy(model)
+        model_hq.transformer.h[0].mlp.c_fc = hq_layer
+        ppl_hq = eval_perplexity(model_hq, tokenizer, eval_texts, MAX_LEN, DEVICE)
+        del model_hq
+
+        hq_results.append((clip_pct, scale_ratio, ppl_hq))
+        print(f"  clip={clip_pct:>3}%  scale_ratio={scale_ratio:>5.1f}×  PPL={ppl_hq:>9.3f}  "
+              f"(delta={ppl_hq-ppl_base:>+9.3f})")
 
     # --- Summary
-    print(f"\n{'='*55}")
+    best_clip, best_ratio, best_ppl = min(hq_results, key=lambda x: x[2])
+    print(f"\n{'='*65}")
     print(f"PPL Summary  (single layer: h0.c_fc, K={K}, bpw=0.5)")
-    print(f"{'='*55}")
-    print(f"  Baseline (FP32):         {ppl_base:>8.3f}")
-    print(f"  Flat k-means:            {ppl_flat:>8.3f}  (+{ppl_flat-ppl_base:.3f})")
-    print(f"  H-weighted k-means:      {ppl_hq:>8.3f}  (+{ppl_hq-ppl_base:.3f})")
-    ppl_gain = ppl_flat - ppl_hq
+    print(f"{'='*65}")
+    print(f"  Baseline (FP32):             {ppl_base:>9.3f}")
+    print(f"  Flat k-means:                {ppl_flat:>9.3f}  (delta={ppl_flat-ppl_base:>+8.3f})")
+    for clip_pct, ratio, ppl_hq in hq_results:
+        marker = " ← best" if clip_pct == best_clip else ""
+        print(f"  H-weighted clip={clip_pct:>3}%:        {ppl_hq:>9.3f}  (delta={ppl_hq-ppl_base:>+8.3f})  "
+              f"ratio={ratio:.1f}×{marker}")
+
+    ppl_gain = ppl_flat - best_ppl
     ppl_gain_pct = ppl_gain / (ppl_flat - ppl_base) * 100 if ppl_flat > ppl_base else 0
-    print(f"\n  H-weighted PPL gain vs flat: {ppl_gain:.3f}  ({ppl_gain_pct:.1f}% of quantization gap)")
-    print(f"  Interpretation: H-weighting recovers {ppl_gain_pct:.0f}% of the PPL degradation")
-    print(f"  caused by quantization at this bit budget.")
+    print(f"\n  Best H-weighted (clip={best_clip}%) vs flat: {ppl_gain:+.3f}  "
+          f"({ppl_gain_pct:.1f}% of quantization gap recovered)")
 
 
 if __name__ == "__main__":

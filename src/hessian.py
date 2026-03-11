@@ -114,6 +114,7 @@ def hessian_quantize(
     block_dim: int,
     K: int,
     n_iter: int = 50,
+    scale_clip_percentile: float = 95.0,
 ) -> dict:
     """
     Hessian-weighted codebook quantization.
@@ -132,8 +133,14 @@ def hessian_quantize(
     assert h_diag.shape[0] == in_f
 
     # --- Scale factor per input dimension: sqrt(H_diag[j])
-    # Add small epsilon for numerical stability
-    scale = (h_diag + 1e-8).sqrt()          # [in_f]
+    # Clip H_diag at the given percentile before sqrt to prevent explosive
+    # amplification of cold-dimension errors on reconstruction.
+    # Without clipping: max/min scale ratio can be 14×, causing 14× amplified
+    # reconstruction errors in cold dims which catastrophically hurt PPL.
+    h_clipped = h_diag.clone()
+    cap = torch.quantile(h_diag.float(), scale_clip_percentile / 100.0)
+    h_clipped = h_clipped.clamp(max=cap.item())
+    scale = (h_clipped + 1e-8).sqrt()       # [in_f]
 
     # --- Scale weight columns by sqrt(H_diag): makes all directions equally costly
     W_scaled = W.float() * scale.unsqueeze(0)  # [out_f, in_f]
