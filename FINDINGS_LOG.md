@@ -673,6 +673,66 @@ The path forward requires fundamentally different strategies:
 
 ---
 
+## Experiment 7 — Layer-dependent critical bpw
+
+**Hypothesis:** The critical bpw (phase transition point) may vary across GPT-2 MLP layers.
+
+**Design:** 6 layers (h0, h5, h11 × c_fc, c_proj), 5 bpw values (0.375–0.625), K=64–1024, bd=16.
+Single-layer swap each time; 75 eval texts; baseline PPL=58.70.
+
+**Results:**
+```
+Layer          shape        bpw=0.375  bpw=0.4375  bpw=0.5  bpw=0.5625  bpw=0.625
+h0.c_fc    (3072, 768)       606,633     9,277       360        248         106
+h0.c_proj   (768,3072)           197       156        98         78          80
+h5.c_fc    (3072, 768)            85        85        81         76          72
+h5.c_proj   (768,3072)            63        63        62         62          62
+h11.c_fc   (3072, 768)            86        81        79         77          73
+h11.c_proj  (768,3072)            64        64        64         64          62
+Baseline                        58.70
+```
+
+### Key findings
+
+**1. h0.c_fc is a unique outlier.**
+Every other layer is quantizable to within 4× of baseline even at bpw=0.375.
+h0.c_fc breaks catastrophically (PPL=606K) at bpw=0.375 and only recovers at bpw=0.5 (PPL=360).
+Critical bpw: h0.c_fc = 0.5; all other tested layers = 0.375 or lower.
+
+**2. c_proj layers are far more robust than c_fc layers.**
+c_proj [768, 3072] (compression: 3072→768): near-lossless at bpw=0.375.
+c_fc [3072, 768] (expansion: 768→3072): harder to quantize, more sensitive.
+h5.c_proj: PPL=63 at bpw=0.375 — essentially indistinguishable from FP32 (58.7).
+
+**3. Early layers (h0) are harder than middle/late layers (h5, h11).**
+h5.c_fc and h11.c_fc both give PPL≈85 at bpw=0.375 vs h0.c_fc's 606,633.
+The first transformer block is uniquely sensitive to quantization error.
+
+### Physics interpretation — RG flow and UV sensitivity
+
+In the renormalization group (RG) picture:
+- h0 operates at the "UV scale" — it processes raw token embeddings, the highest-energy,
+  least-processed inputs. Errors here are amplified by the nonlinearities of all subsequent blocks.
+- h5, h11 operate at "IR scales" — they receive well-structured, partially-processed activations.
+  Perturbations at IR scales are suppressed (irrelevant operators in RG language).
+
+This is analogous to the RG fixed point structure:
+- UV-relevant perturbations (h0 errors) grow under RG flow → amplified by downstream layers
+- IR-irrelevant perturbations (late layer errors) shrink → absorbed without affecting output
+
+**c_fc vs c_proj asymmetry (expansion vs compression):**
+- c_fc (768→3072): feeds the GELU nonlinearity, which acts as a hard gate. Quantization errors
+  near zero get binary-amplified (GELU(ε) ≈ 0 vs GELU(-ε) ≈ 0 but transition is steep).
+- c_proj (3072→768): output added to residual stream. Errors are diluted by the identity
+  shortcut path — the residual connection acts as a quantization error absorber.
+
+**Practical implication for bit allocation (Tier 2 experiment — RG flow):**
+h0.c_fc needs bpw≥0.5 to function. All other MLP layers can use bpw=0.375 (or less).
+A non-uniform bit allocation scheme that gives extra bits to h0.c_fc and fewer to h5–h11
+should significantly reduce total storage while maintaining PPL quality.
+
+---
+
 ## Experiment 6 — Corrected bpw sweep (PPL vs bits)
 
 **Motivation:** The Experiment 0 sweep had the Conv1D bug (all deltas = 0). Now that we have
