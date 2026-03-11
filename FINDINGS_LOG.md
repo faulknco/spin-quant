@@ -799,7 +799,27 @@ Our combined scale is s_j = std(W[:,j])^0.5 × sqrt(H_diag[j])^0.5, which uses t
 α=0.5 geometric mean principle. The col ratio 4.91× matches the "migration balance" that
 makes both activation and weight quantization tractable simultaneously.
 
-**α=0.5 is not necessarily optimal — next experiment: α sweep.**
+**Experiment 10b — Alpha sweep results:**
+```
+α    col_ratio   PPL       vs flat
+0.0   14.57×    1097      -221%   (pure H-diag)
+0.1   10.37×     258       +38%
+0.2    7.38×     236       +45%
+0.3    5.92×     349       +10%
+0.4    5.39×    1334      -294%   ← catastrophic spike
+0.5    4.91×     170       +65%   ← BEST
+0.6    4.46×     182       +61%
+0.7    4.06×     523       -44%
+0.8    3.70×     319       +19%
+0.9    3.37×     868      -150%
+1.0    3.06×     960      -179%   (pure W-std)
+```
+
+α=0.5 confirmed optimal: **65% of the quantization gap recovered.**
+
+The α landscape is highly non-monotone despite col_ratio being monotonically decreasing (14.57× → 3.06×). Two good basins: α≈0.1-0.2 (38-45% recovery) and α≈0.5-0.6 (61-65% recovery), separated by catastrophic spikes at α=0.4 and α=0.7. Same rough-landscape signature seen throughout — multiple local minima, chaotic phase-transition behavior.
+
+The catastrophic spike at α=0.4 (PPL=1334) adjacent to the optimal α=0.5 (PPL=170) suggests k-means initialization sensitivity at specific scale configurations. The scale at α=0.4 (ratio=5.39×) hits a "bad" region of the codebook energy landscape.
 
 ---
 
