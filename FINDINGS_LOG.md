@@ -823,6 +823,54 @@ The catastrophic spike at α=0.4 (PPL=1334) adjacent to the optimal α=0.5 (PPL=
 
 ---
 
+## Experiment 20B — Top-N K128/K64 sweep (K=64 floor)
+
+**Question:** Given that non-uniform compression works when background stays at K=64
+(Exp 19A "top-4 K128/K64"), what is the optimal N? Is the bpw–PPL tradeoff curve
+smooth or does it have a preferred N?
+
+**Design:** `experiments/nonuniform_k64floor.py`. Sweeps N=0,2,4,6,8,10,12,16,20,24
+where the top-N Exp 18 ΔPPL-ranked layers get K_high=128 and all others get K_low=64.
+N=0 = uniform K=64 (baseline). N=24 = uniform K=128.
+
+| N  |   bpw |      PPL | vs N=0 |
+|---:|------:|---------:|-------:|
+|  0 | 0.750 |    439.7 | 1.000× |
+|  2 | 0.760 |    351.9 | 0.800× |
+|  4 | 0.769 |    289.0 | 0.657× |
+|  6 | 0.779 |    241.8 | 0.550× |
+|  8 | 0.787 |    234.8 | 0.534× |
+| 10 | 0.793 |    193.0 | 0.439× |
+| 12 | 0.804 |    173.2 | 0.394× |
+| 16 | 0.820 |    133.4 | 0.303× |
+| 20 | 0.835 |     97.0 | 0.221× |
+| 24 | 0.849 |     87.6 | 0.199× |
+
+FP32 baseline: 63.278.
+
+**Key finding: the curve is monotone — every additional K=128 layer helps.**
+
+There is no optimal N below 24. PPL decreases with every additional sensitive layer
+promoted to K=128, all the way to the uniform K=128 limit. The tradeoff is smooth:
+you get approximately proportional PPL reduction per additional bit of bpw.
+
+**Notable efficiency: N=2 gives 20% PPL reduction for +0.010 bpw (+1.3% overhead).**
+Boosting just the top-2 most sensitive layers (h6.c_proj, h5.c_proj) from K=64 to K=128
+drops PPL from 440 to 352. This is the steepest part of the curve — best return per bit.
+
+**Small plateau at N=6→8:** PPL drops only 7 (242→235) for +0.008 bpw between N=6 and
+N=8. Then N=8→10 recovers (-42 PPL, larger drop). This suggests the Exp 18 ΔPPL ranking
+is not a perfect predictor of which layers benefit most from K=64→128 promotion — the
+ranking measured incremental damage during sequential accumulation, not the benefit from
+per-layer quality improvement in isolation.
+
+**Implication: non-uniform compression with K=64 floor provides a smooth Pareto
+frontier between bpw=0.75 (PPL=440) and bpw=0.85 (PPL=88).** Pick any point on this
+curve for any bpw budget. There is no free lunch: every PPL gain costs bits, but the
+cost is approximately constant per unit PPL improvement.
+
+---
+
 ## Experiment 19A — Data-driven non-uniform compression
 
 **Question:** Can we improve all-layer PPL by reallocating bits budget-neutrally —
