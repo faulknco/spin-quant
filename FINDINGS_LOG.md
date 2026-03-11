@@ -823,6 +823,58 @@ The catastrophic spike at α=0.4 (PPL=1334) adjacent to the optimal α=0.5 (PPL=
 
 ---
 
+## Experiment 19B — Activation-calibrated per-row k-means
+
+**Question:** Does weighting k-means by FP32 input activation magnitudes reduce
+all-layer PPL, especially at lower K?
+
+**Design:** `experiments/activation_calibrated_per_row.py`. For each MLP sublayer,
+runs 20 calibration texts through the FP32 model with a forward hook to capture
+input activations x. Computes per-block weight `act_weight[j] = mean(||x[:, j*d:(j+1)*d]||²)`.
+Weighted k-means scales both distance and centroid update by these weights.
+Compared pairwise vs unweighted per-row at K=16, 32, 64, all-layer, bd=8.
+
+| Config             |  K | cal |       PPL | vs uncal |
+|--------------------|----:|----:|----------:|---------:|
+| per-row K=16 uncal | 16 | no  | 13,763.7  | —        |
+| per-row K=16 cal   | 16 | yes | 38,614.9  | 2.806×   |
+| per-row K=32 uncal | 32 | no  |  2,498.9  | —        |
+| per-row K=32 cal   | 32 | yes |  6,478.1  | 2.592×   |
+| per-row K=64 uncal | 64 | no  |    439.7  | —        |
+| per-row K=64 cal   | 64 | yes |    321.7  | 0.732×   |
+
+FP32 baseline: 63.278
+
+**Key finding: activation calibration has opposite effects at low vs high K.**
+
+At K=16 and K=32, calibration is **strongly harmful** (2.6–2.8× worse PPL).
+At K=64, calibration is **beneficial** (27% PPL improvement: 439.7 → 321.7).
+
+**Mechanism: codebook capacity threshold.**
+
+At low K, the activation-weighted k-means redirects centroids toward high-activation
+blocks while abandoning low-activation ones. When K=16 and n_blocks_per_row=96, each
+centroid must cover ~6 blocks on average. By forcing the codebook to concentrate on
+high-activation positions, many low-activation blocks are quantized with distant
+centroids, generating large reconstruction error. The PPL cost of poor low-activation
+reconstruction exceeds the benefit of better high-activation reconstruction — because
+even "low-activation" blocks contribute non-trivially to output when summed across
+all tokens and layers.
+
+At K=64, there are enough centroids (64/96 ≈ 0.67 centroids per block position on
+average) to cover the space reasonably. The activation weighting shifts quality from
+rarely-fired to frequently-fired positions without catastrophically abandoning any
+region. Net effect: 27% PPL reduction at the same bpw.
+
+**Implication: activation calibration requires sufficient codebook capacity.**
+K=64 (bpw=0.75) is above the threshold where calibration helps. K=32 (bpw=0.625) is
+below it. The crossover is somewhere between K=32 and K=64. Future experiment: find
+the exact crossover K, and test K=96 calibrated (the max for c_fc layers) as the
+highest possible gain point. If the trend continues, K=96 calibrated may approach
+~200–250 PPL — potentially better than uniform K=64 uncalibrated at a lower bpw.
+
+---
+
 ## Experiment 18 — Collective behavior profiling (layer-by-layer accumulation)
 
 **Question:** How and where does quantization error amplify across 24 GPT-2 MLP
