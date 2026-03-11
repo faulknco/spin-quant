@@ -823,6 +823,161 @@ The catastrophic spike at α=0.4 (PPL=1334) adjacent to the optimal α=0.5 (PPL=
 
 ---
 
+## Experiment 13 — Sequential SmoothQuant calibration (all-layer)
+
+**Question:** Does sequential calibration (each layer calibrated using the model with all prior
+layers already quantized) fix the all-layer SmoothQuant catastrophe from Exp 12?
+
+**Design:** Same as Exp 12 (α=0.5, bd=16, K=256, bpw=0.5) but process layers in forward order.
+For each layer i: calibrate H_diag using the current model (layers 0..i-1 already quantized),
+then quantize and replace layer i before moving to i+1.
+Note: within a block, `c_fc` is quantized before `c_proj` is calibrated — fully sequential.
+
+**Results:**
+```
+Config                          single-layer PPL   all-layer PPL   amplification
+flat   bd=16 K=256  (Exp 9)          381              3,042            8.0×
+smooth indep bd=16 K=256 (Exp 12)    170             36,946          217.7×
+smooth seq   bd=16 K=256 (Exp 13)    170             31,662          186.6×
+```
+
+### Key finding: sequential calibration partially helps, but SmoothQuant still catastrophically worse than flat
+
+Sequential calibration improved PPL from 36,946 → 31,662 (**14% better than independent**), but
+is still **10.4× worse than flat all-layer** (3,042). The distribution mismatch hypothesis was
+partially correct — fixing calibration accuracy does reduce amplification (217.7× → 186.6×) —
+but calibration accuracy is not the root cause of the failure.
+
+**Why sequential calibration only partially helps:**
+
+SmoothQuant's forward pass: `output = F.linear(x * s_j, W_q, bias)` where `W_q ≈ W / s_j`.
+
+In theory (perfect quantization): `F.linear(x * s_j, W/s_j, bias) = F.linear(x, W, bias)` — identical.
+In practice: `W_q` has quantization errors different from those of flat-quantized `W`. The scale
+migration `W / s_j` changes the error structure. Sequential calibration correctly identifies the
+actual activation distribution, but cannot undo the fundamental change in how errors accumulate.
+
+**Root cause (revised):** The all-layer SmoothQuant failure is NOT primarily about calibration
+accuracy — it's about error accumulation structure. Flat k-means errors and smooth k-means errors
+have different cross-layer interaction properties:
+
+- **Flat errors** are approximately symmetric (each layer's error pattern is random/unstructured).
+  With 24 layers of random errors, some cancellation occurs, limiting amplification to 8×.
+- **Smooth errors** concentrate near the boundaries of the column-scale structure. These errors
+  are correlated with the activation pattern `x` in a specific way (errors are largest where
+  `x * s_j` forces the codebook to cover a wide range). Across 24 layers, these structured
+  errors compound multiplicatively rather than averaging out: 186×+ amplification.
+
+Sequential calibration narrows the gap (217→187) by giving each layer a more accurate col_scale,
+reducing the degree of scale mismatch. But it cannot change the fundamental error structure of
+smooth k-means quantization, which remains more adversarial to all-layer stacking than flat.
+
+**Physics interpretation — symmetry breaking and error correlations:**
+Flat k-means preserves an approximate permutation symmetry in the weight error distribution —
+errors are isotropic in codebook space. SmoothQuant breaks this symmetry explicitly by aligning
+the quantization grid with the column scale structure. In a single layer, this symmetry breaking
+is beneficial (it aligns the error structure with the input distribution). Across 24 layers,
+the aligned error structures from all layers create constructive interference (resonance), while
+the isotropic flat errors interfere destructively (partial cancellation).
+
+This is analogous to the difference between random disorder and correlated disorder in a spin
+glass: random disorder → Anderson localization (errors stay bounded); correlated disorder →
+delocalization (errors propagate coherently through the system).
+
+**Practical conclusion:**
+SmoothQuant as implemented here is incompatible with all-layer k-means codebook quantization
+even with sequential calibration. The single-layer benefit (55% PPL reduction) reverses at
+the all-layer level regardless of calibration strategy.
+
+**All-layer results so far:**
+```
+Strategy                      all-layer PPL    vs baseline   amplification
+flat bd=16 K=256 (Exp 9)         3,042          51.0×            8.0×
+smooth indep bd=16 K=256 (Exp12) 36,946         619.5×          217.7×
+smooth seq   bd=16 K=256 (Exp13) 31,662         530.9×          186.6×
+flat bd=8  K=16  (Exp 12)       225,031        3774.8×           structured resonance
+```
+Flat bd=16 K=256 remains the best all-layer configuration at bpw=0.5.
+
+---
+
+## Experiment 12 — All-layer quantization with SmoothQuant
+
+**Question:** Does the single-layer SmoothQuant improvement (55% PPL reduction, Exp 10) carry
+through to all-layer quantization? Expected (proportional): 3,042 × (170/381) ≈ 1,357.
+
+**Design:** Quantize all 24 MLP layers (h0-h11 × c_fc, c_proj) with SmoothQuant α=0.5, bd=16, K=256.
+Per-layer H_diag estimated from 50 calibration texts each (48 calibration passes total).
+Baseline = 59.640; Exp 9 ref (flat same config) = 3,042.
+
+**Results:**
+```
+Config                     single-layer PPL   all-layer PPL   amplification
+flat   bd=16 K=256 (Exp 9)     381                3,042            8.0×
+smooth bd=16 K=256 (Exp 12)    170               36,946          217.7×
+```
+
+### Key finding: SmoothQuant is CATASTROPHIC at all-layer level
+
+SmoothQuant improved single-layer PPL by 55% (381→170) but made all-layer PPL **12× worse**
+(3,042→36,946). Amplification factor: 217.7× vs 8.0× for flat — 27× more destructive per layer.
+
+**Root cause — inter-layer activation distribution mismatch:**
+
+SmoothQuant works by migrating column scale `s_j` to the activation path:
+```
+Forward: F.linear(x * s_j, W / s_j, bias)
+```
+This is calibrated using H_diag estimated from the *base model's* activation distribution.
+Each layer's scale `s_j` is calibrated independently assuming standard input activations.
+
+But when ALL layers are modified:
+- Layer 0's SmoothQuant scale changes its output activation distribution
+- Layer 1 receives modified activations that don't match its calibration distribution
+- Layer 1's `s_j` was calibrated for the base model's activations, not layer 0's smoothed outputs
+- The mismatch compounds multiplicatively across all 24 layers
+
+The scale vector `s_j` acts as a per-channel gain on the activations flowing through the network.
+With 24 independently-calibrated gain corrections applied in sequence, activation distributions
+diverge chaotically from the base model, producing catastrophic PPL.
+
+**Contrast with flat quantization:**
+Flat k-means (no scale migration) degrades each layer approximately symmetrically — the output
+distribution of a flat-quantized layer is similar to its input distribution (just noisier). The
+residual stream therefore remains statistically similar across layers, and errors accumulate
+arithmetically rather than multiplicatively. Result: 8.0× amplification vs 217.7×.
+
+**Why single-layer SmoothQuant works but all-layer does not:**
+In the single-layer case, only h0.c_fc is modified. The model compensates via the 23 remaining
+FP32 layers — they see slightly different activations but their weights perfectly match those
+activations (no scale mismatch). The SmoothQuant improvement is real but requires a "clean"
+context (other layers unmodified) to work.
+
+**Physics interpretation — frustrated order parameter:**
+In a spin system, applying a local field (SmoothQuant scale) to each spin independently is fine
+if spins are decoupled. But when spins are strongly coupled (sequential layers with residual
+connections), independent local fields induce frustration: each spin is simultaneously trying
+to satisfy its own local field AND its coupling to neighboring spins. The result is a frustrated
+state worse than either pure order or pure disorder.
+
+**Practical implication:**
+SmoothQuant as implemented here is NOT suitable for all-layer quantization without joint
+calibration. A correct all-layer SmoothQuant must:
+1. Propagate activation distributions through the modified model during calibration, OR
+2. Use a joint optimization of all {s_j} scales simultaneously, OR
+3. Apply end-to-end finetuning after scale assignment
+
+**Status of all-layer approaches:**
+```
+Strategy                     all-layer PPL    vs baseline
+flat bd=16 K=256 (Exp 9)       3,042          51.0×
+flat bd=8  K=16  (Exp 12)    225,031        3774.8×  ← structured resonance
+smooth bd=16 K=256 (Exp 12)   36,946         619.5×  ← activation mismatch
+```
+The flat bd=16 K=256 configuration remains the best all-layer quantization at bpw=0.5.
+
+---
+
 ## Experiment 11 — SmoothQuant + block_dim combination
 
 **Question:** Do SmoothQuant (Exp 10) and optimal bd=8 (Exp 8) improvements combine?
