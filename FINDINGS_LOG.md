@@ -256,19 +256,90 @@ because not all weight directions equally affect model outputs.
 - Unscale centroids: C_unscaled = C_scaled / sqrt(H_diag[block_indices])
 - Compare: flat k-means RMSE vs H-weighted k-means RMSE (both flat and H-weighted metrics)
 
-**Status:** Running.
+**Status:** Completed.
+
+**Results — H_diag statistics (h0.c_fc, 100 calibration texts):**
+```
+mean:             0.0222
+std:              0.0519
+min:              0.004670
+max:              0.9910
+dynamic range:    23.3 dB  (214× from min to max)
+coeff variation:  2.336    (>> 1 = highly non-uniform)
+'hot' dims (>10x mean): 0.7%   (~5-6 out of 768 dims)
+```
+
+**Results — comparison table (block_dim=16):**
+```
+K      bpw    flat_RMSE   h_RMSE_flat   h_RMSE_hq    gain%
+16    0.250    0.125252     0.017313     0.016643      3.9%
+64    0.375    0.115218     0.016134     0.015070      6.6%
+256   0.500    0.106731     0.015016     0.013856      7.7%
+1024  0.625    0.097229     0.013806     0.012570      9.0%
+```
+
+### Interpretation
+
+**The Hessian is highly non-uniform (CV = 2.336, DR = 23.3 dB).**
+The activation energy E[x_j²] varies by 214× across the 768 input dimensions.
+Only 0.7% of dimensions (~5-6) are "hot" (>10× mean) — these are the LLM outlier dimensions
+documented in LLM.int8() and SmoothQuant literature. Our H-diagonal weighting naturally
+protects them without any special outlier handling.
+
+**Hessian weighting consistently reduces the loss-weighted error (gain 3.9%→9.0%).**
+The gain increases monotonically with K. This is physically meaningful:
+- At small K: quantization is coarse everywhere; H-weighting helps little because the
+  codebook is too small to allocate extra coverage to hot dimensions.
+- At large K: finer codebook allows H-weighting to specifically cluster centroids near
+  the values of hot-dimension weights; gain compounds with each additional centroid.
+- Trend suggests gain would continue growing to ~12-15% at K=4096 before plateauing.
+
+**Spin-glass framing:**
+The coupling matrix J_ij is sparse: 99.3% of dimensions are weakly coupled (low E[x_j²]),
+0.7% are strongly coupled ("frustrated spins"). Flat k-means treats all equally and
+wastes codebook entries on insensitive dimensions. H-weighted k-means concentrates
+entries near the sensitive directions — exactly what the spin-glass ground state search
+should do.
+
+**Practical conclusion:** Hessian weighting gives a real, consistent improvement in the
+metric that matters (loss-weighted error), with gains increasing as codebook gets finer.
+The absolute gain (~8% at K=256) is moderate, suggesting the H_diag approximation
+captures the effect partially. Full off-diagonal Hessian (GPTQ approach) would likely
+give larger gains at the cost of more computation.
 
 ---
 
 ## Open questions
 
-1. Does the Hessian-weighted codebook outperform flat k-means on PPL (not just RMSE)?
-2. Is H_diag actually structured (low-rank)? If so, what is its effective rank?
-3. Does α≈0.5 hold for larger models (LLaMA, Mistral)? If so, it's a universal property of SGD.
-4. Can MPS bond dimension replace codebook size K as a compression knob?
-5. Does per-layer bit allocation (RG flow) help when combined with any of the above schemes?
-6. What is the "phase transition" bpw below which PPL diverges for each scheme?
-   (analogous to a phase transition in the spin model)
+1. Does Hessian-weighted codebook outperform flat k-means on PPL (not just H-weighted RMSE)?
+   → Need PPL evaluation with Conv1D fix. Expected: yes, mirroring RMSE gain.
+2. Does the gain increase further with more calibration data (>100 texts)?
+   → H_diag estimate from 100 texts may be noisy; more data should sharpen it.
+3. Is H_diag structured (low-rank)? What is its effective rank?
+   → If H_diag itself has structure (e.g. follows a power law), this motivates a
+      "spectral Hessian" approach: quantize in the eigenbasis of H, not just diagonal.
+4. Does α≈0.5 hold for larger models (LLaMA, Mistral)?
+   → If yes, Marchenko-Pastur bulk is a universal property of SGD-trained weights.
+5. Can full off-diagonal Hessian (GPTQ-style) give substantially larger gains than diagonal?
+   → Diagonal H_diag captures input sensitivity but not inter-weight correlations.
+6. Can MPS bond dimension replace codebook size K as a compression knob?
+7. Does per-layer bit allocation (RG flow) help when combined with Hessian weighting?
+8. What is the "phase transition" bpw below which PPL diverges?
+   (analogous to a phase transition in the spin model at critical temperature)
+
+## Scheme performance summary (h0.c_fc, bpw≈0.5)
+
+| Scheme | bpw | RMSE | H-RMSE | Notes |
+|--------|-----|------|--------|-------|
+| Flat k-means (scalar) | 0.500 | 0.1067 | 0.01502 | baseline |
+| SVD-quant (r=38) | 0.495 | 0.1265 | — | 18% worse RMSE |
+| H-weighted k-means | 0.500 | — | 0.01386 | 7.7% better H-RMSE |
+| DCT (keep_k=8) | 0.500 | >> flat | — | not viable, flat spectrum |
+
+**Ranking so far:** H-weighted k-means > Flat k-means >> DCT ≈ SVD-quant
+
+The flat k-means scalar codebook is still the best RMSE baseline. Hessian weighting
+improves the *right* metric (loss-weighted) by ~8% at no extra storage cost.
 
 ---
 
