@@ -823,6 +823,138 @@ The catastrophic spike at α=0.4 (PPL=1334) adjacent to the optimal α=0.5 (PPL=
 
 ---
 
+## Experiment 14 — Per-row codebooks ← MAJOR BREAKTHROUGH
+
+**Question:** Does giving each output row its own independent k-means codebook eliminate
+the cross-row centroid competition that limits flat k-means?
+
+**Design:** For each of the 3072 output rows of h0.c_fc, run k-means on just that row's
+blocks (48 blocks for bd=16, 96 for bd=8). Precompute the full reconstructed W_q and store
+as a weight buffer. No cross-row centroid sharing. Target: h0.c_fc, 150 eval texts.
+
+Note: K must be ≤ n_blocks_per_row (768/bd). For bd=16: K≤48; for bd=8: K≤96.
+
+**Results:**
+```
+Config                  bd    K    bpw      PPL     delta   gap recovery
+(A) flat    bd=16 K=256  16   256  0.500   380.618  +324.5     ref
+(B) flat    bd=8  K=16    8    16  0.500   154.340   +98.2    +59.5%
+(C) per-row bd=8  K=16    8    16  0.500    71.014   +14.9    +95.4%  ← same bpw as B
+(D) per-row bd=8  K=64    8    64  0.750    56.397    +0.3    +99.9%  ← near-lossless
+(E) per-row bd=16 K=32   16    32  0.313    58.423    +2.3    +99.3%  ← below flat Tc!
+(F) per-row bd=16 K=16   16    16  0.250    70.370   +14.3    +95.6%  ← at 0.25 bpw
+Baseline (FP32): 56.090
+```
+
+### Key findings
+
+**1. Per-row at bpw=0.5 (config C vs B): 71.0 vs 154.3 — 2.2× better at identical bpw.**
+Same K=16, same bd=8, same bpw=0.5. The ONLY change: per-row vs shared codebook.
+The 2.2× improvement is entirely due to eliminating cross-row centroid competition.
+
+**2. Near-lossless at 0.75 bpw (config D): PPL=56.4 — only 0.307 above FP32.**
+Flat k-means needed bpw≈1.5 for near-lossless. Per-row achieves it at 0.75 bpw — 2× compression
+improvement in the near-lossless regime.
+
+**3. Near-lossless BELOW the flat phase transition (config E): PPL=58.4 at bpw=0.313.**
+The flat k-means phase transition is at bpw≈0.5 (below this: catastrophic failure).
+Per-row achieves near-lossless quality at bpw=0.313 — below the flat critical threshold.
+The phase transition boundary has been pushed dramatically lower.
+
+**4. Still useful at 0.25 bpw (config F): PPL=70.4 — only 25% above FP32.**
+Flat k-means at bpw=0.25 gives PPL=393,677 (completely broken, Exp 8).
+Per-row at bpw=0.25 gives PPL=70.4. The transition structure is fundamentally different.
+
+### Root cause: cross-row magnitude heterogeneity
+
+The flat k-means failure was always cross-row, not cross-column. In W ∈ ℝ^{3072×768}:
+- Different output rows have very different weight magnitudes (high-norm vs low-norm rows)
+- All rows compete for the same K centroids
+- The codebook calibrates to the mean magnitude, giving coarse resolution to extreme rows
+
+Per-row codebooks give each row exactly K centroids fitted to that row's own distribution.
+No compromise between rows. Each row gets optimal quantization independently.
+
+This is the k-means analog of "per-channel (per-output-neuron) quantization" in INT quant —
+a known best practice in quantization that we hadn't applied to vector codebooks.
+
+### Why the phase transition boundary shifts
+
+In flat k-means, the phase transition at bpw≈0.5 reflects the minimum K needed for the
+shared codebook to cover both high-norm and low-norm rows adequately. Below this K,
+some rows are catastrophically mis-quantized.
+
+In per-row k-means, each row's quantization quality depends only on K relative to that row's
+own block count and weight distribution. Even K=16 (bpw=0.25 with bd=16) provides 16 centroids
+specifically tuned to each row's range — more than adequate for most rows.
+
+The critical K threshold scales with the complexity of the *single-row* weight distribution,
+not the combined complexity of all 3072 rows. This is dramatically more favorable.
+
+**Physics interpretation:**
+Flat k-means is like fitting a single Ising model to a heterogeneous lattice with different
+coupling strengths — the mean-field solution is suboptimal for all sites simultaneously.
+Per-row k-means is like having a separate mean-field solution per site, calibrated to that
+site's coupling strength. The freedom to have site-specific "local order parameters" eliminates
+the global frustration that caused the sharp phase transition.
+
+---
+
+## Experiment 15 — Block-local H-weighted k-means
+
+**Question:** Does normalizing H_diag within each block (rather than globally) fix the
+catastrophic failure of global H-weighted k-means (Exp 3-5b)?
+
+**Design:** For each block of block_dim dimensions, normalize H_diag by the block mean
+before applying as k-means weights. This bounds within-block scale ratio to ~1.0 while
+preserving relative importance ordering within blocks. Single global codebook shared
+across all blocks (like flat k-means), but with block-local H-weighted distance metric.
+
+**Results:**
+```
+Config            bd    K    bpw      PPL     H-RMSE   vs flat-A
+(A) flat          16   256  0.500   380.618   0.01500     ref
+(B) flat           8    16  0.500   154.340   0.01537    +59.5%
+(C) block-local-H 16   256  0.500  2157.864   0.01390   -467%   FAILURE
+(D) block-local-H  8    16  0.500  1050.261   0.01505   -176%   FAILURE
+(E) global-H      16   256  0.500  2931.727   0.01385   -670%   FAILURE (replicated)
+H_diag range: [0.0047, 0.9910], ratio=212×, CV=2.336
+```
+
+### Key findings
+
+**1. Block-local H-weighting still fails, even without global scale amplification.**
+Config C: PPL=2157 (5.7× worse than flat). The block-local normalization reduces the
+severity vs global-H (2931), but it remains catastrophically bad.
+
+**2. Global-H (config E) gives PPL=2932 here vs PPL=300k+ in Exp 3-5.**
+Both use the same algorithm but differ in implementation:
+- Exp 3-5: stored scaled centroids + inference-time unscaling → cold-dim errors amplified 14× at EVERY forward pass
+- Exp 15: precomputed W_q at construction → errors are baked in once, not amplified at inference
+PPL=2932 vs PPL=380 (flat) confirms H-weighting degrades PPL even without the inference-time amplification bug.
+
+**3. Root cause: block-local normalization fixes the WRONG problem.**
+Per-row codebooks (Exp 14) achieved PPL=71 at the same bpw by addressing CROSS-ROW magnitude
+heterogeneity. Block-local H addresses within-row COLUMN sensitivity variation (H_diag variation
+across input dimensions). These are different axes of heterogeneity:
+- Cross-row (Exp 14 fix): different output neurons have different weight magnitudes → per-row codebooks
+- Cross-column (H-weighting): different input dimensions have different activation magnitudes → SmoothQuant
+
+H-weighting attempts to fix cross-column sensitivity, but the bottleneck was cross-row magnitude.
+Fixing the wrong axis does not help and can hurt (it disrupts the natural within-block structure
+that flat k-means exploits).
+
+**4. H-RMSE is again an unreliable predictor.**
+Config C has better H-RMSE (0.01390) than flat config A (0.01500) but 5.7× worse PPL.
+This continues the pattern established in Exp 3-5b: H-RMSE in weight space does not
+predict inference-quality PPL.
+
+**Practical conclusion:**
+Block-local H-weighted k-means is not a viable improvement path. The per-row codebook
+approach (Exp 14) is the correct fix for flat k-means limitations at this bpw regime.
+
+---
+
 ## Experiment 13 — Sequential SmoothQuant calibration (all-layer)
 
 **Question:** Does sequential calibration (each layer calibrated using the model with all prior
