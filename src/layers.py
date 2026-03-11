@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from .codebook import quantize_blocks, reconstruct
 from .physics import on_quantize, on_reconstruct, rg_quantize, rg_reconstruct
+from .frequency import dct_quantize, dct_reconstruct, wht_quantize, wht_reconstruct
 
 
 class CodebookLinear(nn.Module):
@@ -132,6 +133,70 @@ class RGLinear(nn.Module):
             "W_shape": self._W_shape,
         }
         return rg_reconstruct(state)
+
+    def forward(self, x):
+        return F.linear(x, self.dequantize(), self.bias)
+
+
+class FreqLinear(nn.Module):
+    """
+    Frequency-domain quantization: DCT or WHT basis.
+
+    Physics framing:
+      Transform each weight block into momentum space.
+      Low-k modes (low-frequency) carry most energy — keep and quantize these.
+      High-k modes are truncated to zero (like integrating out UV modes in RG).
+
+    Storage: keep_k scalar indices per block (log2(n_levels) bits each) instead
+             of block_dim floats. The transform itself is implicit (not stored).
+    """
+
+    def __init__(self, in_features, out_features, state: dict, mode: str, bias=None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.mode = mode  # "dct" or "wht"
+        self.register_buffer("idx", state["idx"])
+        self.register_buffer("c_min", state["c_min"].float())
+        self.register_buffer("c_range", state["c_range"].float())
+        self._n_levels  = state["n_levels"]
+        self._keep_k    = state["keep_k"]
+        self._block_dim = state["block_dim"]
+        self._W_shape   = state["W_shape"]
+        if mode == "wht":
+            self.register_buffer("H", state["H"].float())
+        if bias is not None:
+            self.bias = nn.Parameter(bias.clone().float())
+        else:
+            self.bias = None
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, block_dim: int = 16,
+                    keep_k: int = 8, n_levels: int = 256, mode: str = "dct"):
+        assert mode in ("dct", "wht")
+        W = linear.weight.data
+        if mode == "dct":
+            state = dct_quantize(W, block_dim, keep_k, n_levels)
+        else:
+            state = wht_quantize(W, block_dim, keep_k, n_levels)
+        bias = linear.bias.data if linear.bias is not None else None
+        return cls(linear.in_features, linear.out_features, state, mode, bias)
+
+    def dequantize(self) -> torch.Tensor:
+        state = {
+            "idx":       self.idx,
+            "c_min":     self.c_min,
+            "c_range":   self.c_range,
+            "n_levels":  self._n_levels,
+            "keep_k":    self._keep_k,
+            "block_dim": self._block_dim,
+            "W_shape":   self._W_shape,
+        }
+        if self.mode == "dct":
+            return dct_reconstruct(state)
+        else:
+            state["H"] = self.H
+            return wht_reconstruct(state)
 
     def forward(self, x):
         return F.linear(x, self.dequantize(), self.bias)

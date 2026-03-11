@@ -15,25 +15,46 @@ from datasets import load_dataset
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from transformers.pytorch_utils import Conv1D
 from src.layers import CodebookLinear, ONLinear, RGLinear
 
 
 def get_mlp_layers(model):
-    """Return (name, parent_module, attr_name) for all MLP linear layers in GPT-2."""
+    """
+    Return (name, parent_module, attr_name) for all MLP linear layers in GPT-2.
+
+    GPT-2 in HuggingFace uses Conv1D (weight shape [in, out]) not nn.Linear
+    ([out, in]), so we detect both.
+    """
     targets = []
     for block_idx, block in enumerate(model.transformer.h):
         for attr in ["c_fc", "c_proj"]:
             layer = getattr(block.mlp, attr, None)
-            if layer is not None and isinstance(layer, torch.nn.Linear):
+            if layer is not None and isinstance(layer, (torch.nn.Linear, Conv1D)):
                 targets.append((f"h[{block_idx}].mlp.{attr}", block.mlp, attr))
     return targets
+
+
+def conv1d_to_linear(layer) -> torch.nn.Linear:
+    """
+    Convert a HuggingFace Conv1D to nn.Linear.
+    Conv1D stores weight as [in_features, out_features]; Linear stores [out, in].
+    """
+    if isinstance(layer, torch.nn.Linear):
+        return layer
+    in_f, out_f = layer.weight.shape
+    lin = torch.nn.Linear(in_f, out_f, bias=layer.bias is not None)
+    lin.weight = torch.nn.Parameter(layer.weight.T.contiguous())
+    if layer.bias is not None:
+        lin.bias = torch.nn.Parameter(layer.bias.clone())
+    return lin
 
 
 def quantize_model(model, args):
     targets = get_mlp_layers(model)
     print(f"Quantizing {len(targets)} layers with scheme={args.scheme} ...")
     for name, parent, attr in targets:
-        linear = getattr(parent, attr)
+        linear = conv1d_to_linear(getattr(parent, attr))
         if args.scheme == "scalar":
             q_layer = CodebookLinear.from_linear(linear, block_dim=args.block_dim, K=args.K)
         elif args.scheme == "on":

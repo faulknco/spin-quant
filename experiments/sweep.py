@@ -16,7 +16,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.layers import CodebookLinear
-from experiments.eval_perplexity import eval_perplexity, get_mlp_layers
+from experiments.eval_perplexity import eval_perplexity, get_mlp_layers, conv1d_to_linear
 
 
 MODEL_NAME = "gpt2"
@@ -40,7 +40,7 @@ def quantize_all_mlp(model, block_dim, K):
     import copy
     m = copy.deepcopy(model)
     for _, parent, attr in get_mlp_layers(m):
-        linear = getattr(parent, attr)
+        linear = conv1d_to_linear(getattr(parent, attr))
         setattr(parent, attr, CodebookLinear.from_linear(linear, block_dim=block_dim, K=K))
     return m
 
