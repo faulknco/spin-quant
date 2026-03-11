@@ -532,7 +532,50 @@ This is the "sort spins by coupling strength before lattice quantization" approa
 Physics analogy: in a frustrated lattice model, reordering sites so that similar-coupling
 spins are neighbours reduces frustration and allows the ground state to be found more easily.
 
-**Status: running sorted H-weighted experiment (Experiment 4b).**
+**Experiment 4b — Sorted H-weighted results:**
+```
+Within-block H_diag ratio: mean=1.26×  max=10.07×  (reduced from 214× global)
+PPL sorted H-weighted: 2110.064  (delta=+2053.974)
+PPL flat k-means:       380.618  (delta=+324.528)
+```
+Sorting still 5.5× worse than flat k-means despite reducing within-block scale ratio to 1.26×.
+
+**Second failure mode: sorting destroys weight correlation structure.**
+
+In unsorted flat k-means, 16-dim blocks contain consecutive input dimensions. Consecutive
+weight dimensions are correlated — trained together, respond to similar features. This
+joint distribution is well-clusterable: k-means finds good centroids.
+
+When sorted by H_diag, blocks contain dimensions with similar activation energy but
+potentially zero weight correlation. The joint distribution of sorted blocks is nearly
+random — k-means finds poor centroids because the data lacks cluster structure.
+Larger reconstruction errors result despite the more uniform sensitivity weighting.
+
+**Proof by exhaustion — diagonal H-weighted block k-means cannot work:**
+
+| Approach            | Failure mode                                     | PPL   |
+|---------------------|--------------------------------------------------|-------|
+| Unclipped           | 14× scale amplification of cold-dim errors       | 4553  |
+| Clipped (all pcts)  | Non-monotonic: hot dims suppressed OR blown up   | 1055–53941 |
+| Sorted              | Destroys weight correlation structure            | 2110  |
+| **Flat k-means**    | **No sensitivity — preserves weight structure**  | **381** |
+
+**Root cause of all failures:** Sensitivity structure (H_diag ordering) and weight
+correlation structure (joint distribution of blocks) are orthogonal. No block layout
+satisfies both. The information needed to fix quantization (H_diag) cannot be injected
+into the block k-means objective without breaking the thing that makes k-means work.
+
+**What IS required:**
+1. Per-column quantization (no block mixing; each input dim quantized independently)
+2. Full Hessian rotation — rotate into eigenbasis of E[xx^T] where correlations are
+   diagonalized, THEN apply uniform quantization. This is exactly what GPTQ does.
+3. SmoothQuant-style activation scaling: migrate scale to the activation path rather
+   than absorbing it into the weight reconstruction.
+
+**The positive outcome of these failures:** Each failed approach tells us precisely
+which property it lacks. Together they triangulate the GPTQ design from first principles:
+you cannot use a diagonal approximation with block structure. You need the full
+covariance rotation. This is a principled derivation, not just an empirical observation.
 
 ---
 
