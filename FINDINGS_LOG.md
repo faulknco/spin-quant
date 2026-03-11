@@ -823,6 +823,151 @@ The catastrophic spike at α=0.4 (PPL=1334) adjacent to the optimal α=0.5 (PPL=
 
 ---
 
+## Experiment 17 — Per-row all-layer quantization
+
+**Question:** Does the per-row single-layer improvement (2.2× at bpw=0.5) carry through to all 24 layers?
+Expected if proportional: 3,042 × (71/154) ≈ 1,400.
+
+**Design:** Quantize all 24 MLP layers (h0-h11 × c_fc, c_proj) with per-row k-means.
+No H_diag calibration needed — per-row doesn't alter activation distributions.
+100 eval texts; baseline PPL=59.640.
+
+**Results:**
+```
+Config                        single-layer   all-layer    amplification   vs flat all-layer
+flat   bd=16 K=256  bpw=0.500    381          3,042            8.0×           ref (Exp 9)
+per-row bd=8  K=16  bpw=0.500    71          14,354          202×            4.7× WORSE
+per-row bd=16 K=32  bpw=0.313    58           2,841           48×            7% better
+per-row bd=8  K=64  bpw=0.750    56             422            7.5×           7.2× BETTER
+```
+
+### Key findings
+
+**1. Per-row at K=16 (0.5 bpw) is WORSE than flat all-layer (14,354 vs 3,042).**
+Despite being 2.2× better at single-layer (71 vs 154), per-row K=16 all-layer is catastrophically
+worse. The per-row row-structured errors compound more destructively than flat errors across 24
+layers. 202× amplification (vs 8× for flat).
+
+**2. Per-row at K=32 (0.313 bpw) is slightly better than flat all-layer (2,841 vs 3,042).**
+Even though this has higher relative amplification (48×), the absolute single-layer error is so
+much smaller (58 vs 381) that the all-layer result edges out flat.
+
+**3. Per-row at K=64 (0.75 bpw) is 7.2× better than flat all-layer (422 vs 3,042). ← BEST**
+Near-lossless single-layer (PPL=56) + 7.5× amplification = PPL=422 all-layer. This is the
+best all-layer result in the entire project by a wide margin.
+
+### Amplification structure
+
+Per-row k-means errors are row-structured: each row's K patterns create systematic residuals
+that are correlated within that row across all tokens. When 24 layers all have row-structured
+errors, they can compound constructively (202× for K=16) or additively (7.5× for K=64)
+depending on whether the per-row error magnitude overwhelms the residual stream.
+
+The non-monotone pattern from flat all-layer (Exp 9) is reversed here: per-row all-layer PPL
+is monotonically improving with K (14,354 → 2,841 → 422). More bits always helps for per-row
+all-layer, unlike flat where higher bpw could make things worse.
+
+### All-layer comparison summary (all at or near bpw=0.5 where applicable)
+
+```
+Strategy                          bpw    single-layer PPL   all-layer PPL
+flat bd=16 K=256 (Exp 9)         0.500       381              3,042   ← prev best
+smooth indep (Exp 12)             0.500       170             36,946
+smooth seq   (Exp 13)             0.500       170             31,662
+per-row bd=8  K=16 (Exp 17A)     0.500        71             14,354
+per-row bd=16 K=32 (Exp 17B)     0.313        58              2,841
+per-row bd=8  K=64 (Exp 17C)     0.750        56                422  ← NEW BEST
+```
+
+**Best all-layer result: per-row bd=8 K=64 bpw=0.75 → PPL=422 (7.2× better than prev best).**
+
+---
+
+## Experiment 16 — Per-row BPW sweep (h0.c_fc)
+
+**Question:** Where is the per-row phase transition? Flat hits it at bpw≈0.5. Per-row
+eliminates cross-row competition — the critical K should be much lower.
+
+**Design:** Sweep K for bd=8 (K=2..96) and bd=16 (K=2..48) on h0.c_fc. 100 eval texts.
+Constraint: K ≤ n_blocks_per_row = in_features/block_dim (96 for bd=8; 48 for bd=16).
+
+**Results:**
+```
+bd=8  (n_blocks_per_row=96)     Baseline=59.640
+  K=2   bpw=0.125   PPL=956,934   BROKEN
+  K=4   bpw=0.250   PPL= 64,016   BROKEN
+  K=8   bpw=0.375   PPL=    133   ← TRANSITION (flat_ref at bpw=0.5: 154)
+  K=16  bpw=0.500   PPL=     75
+  K=32  bpw=0.625   PPL=     62   near-lossless
+  K=64  bpw=0.750   PPL=     60   essentially lossless
+  K=96  bpw=0.823   PPL= 59.640   EXACT FP32 ← K=n_blocks: perfect reconstruction
+
+bd=16  (n_blocks_per_row=48)    Baseline=59.640
+  K=2   bpw=0.062   PPL=9,942,334   BROKEN
+  K=4   bpw=0.125   PPL=  449,118   BROKEN
+  K=8   bpw=0.188   PPL=      341   ← TRANSITION
+  K=16  bpw=0.250   PPL=       75
+  K=32  bpw=0.312   PPL=       62   near-lossless
+  K=48  bpw=0.349   PPL= 59.640     EXACT FP32 ← K=n_blocks: perfect reconstruction
+```
+
+### Key findings
+
+**1. Per-row phase transition: K=4→8 boundary for both bd values.**
+- bd=8: broken at K≤4 (bpw≤0.25), usable at K≥8 (bpw≥0.375)
+- bd=16: broken at K≤4 (bpw≤0.125), usable at K≥8 (bpw≥0.188)
+
+Compare to flat: broken below bpw≈0.5 for BOTH bd values. Per-row pushes the critical bpw
+down from 0.5 to 0.188 (bd=16) — a **2.7× reduction** in the minimum viable bpw.
+
+**2. Per-row flat comparison at same bpw:**
+- Flat bd=8 K=16 (0.5 bpw): PPL=154 → Per-row bd=8 K=16: PPL=75 (2× better)
+- Flat bd=8 K=32 (0.625 bpw): PPL=16,423 (BROKEN) → Per-row bd=8 K=32: PPL=62 (perfectly usable)
+  Per-row eliminates the non-monotone chaos of flat k-means!
+
+**3. K=n_blocks_per_row → exact FP32 reconstruction.**
+When K = n_blocks_per_row, every block in every row gets its own private centroid.
+k-means with K=N data points trivially assigns each point to its own cluster: the centroid
+IS the data point. Reconstruction error = 0 within each row. PPL = FP32 baseline exactly.
+This is a mathematical self-consistency check, not a useful compression target.
+
+**4. Per-row has NO non-monotone chaos (unlike flat).**
+Flat k-means at bd=8 K=32 (0.625 bpw) gives PPL=16,423 — catastrophic spike worse than
+K=16 at the same bd. Per-row at bd=8 K=32 gives PPL=62 — smooth improvement over K=16.
+Per-row PPL is monotonically decreasing in K for both bd values. No chaotic phase.
+
+**5. bd=16 more bit-efficient than bd=8 for per-row:**
+At bpw≈0.25: bd=16 K=16 → PPL=75; bd=8 needs K=16 (bpw=0.5) for similar PPL.
+bd=16 per-row achieves the same quality at half the bpw of bd=8 per-row.
+
+### Physics interpretation
+
+**Per-row phase transition is a single-row property, not a whole-matrix property.**
+
+In flat k-means, the critical K must be large enough to cover the full weight distribution of
+ALL rows simultaneously. For a matrix with heterogeneous row norms, this requires large K
+(~256 for GPT-2 h0.c_fc at bd=16).
+
+In per-row k-means, each row needs K large enough to represent its OWN 48 (or 96) blocks
+adequately. The required K scales with the complexity of a single row's weight distribution,
+not the whole matrix. A single row of GPT-2 h0.c_fc has relatively uniform statistics —
+the critical K is just 4-8 (just enough to cover the few distinct weight magnitudes in one row).
+
+The sharp transition at K=4→8 suggests that a single GPT-2 MLP row has ~4-8 distinct weight
+"clusters" in its natural distribution. Below K=4, critical under-coverage. At K=8, adequate.
+
+This is the RG interpretation: flat k-means sees the full UV-to-IR scale of the weight
+distribution (all rows' heterogeneity). Per-row k-means operates at the "local" scale of each
+row — much lower complexity, much lower critical K.
+
+**Monotone per-row vs non-monotone flat:**
+Flat chaos (e.g., bd=8 K=32 PPL=16,423) arises because adding more centroids can place them
+in configurations that INCREASE reconstruction error for some rows (k-means local minima in
+the joint space). Per-row k-means optimizes each row independently — adding more per-row
+centroids can only improve or maintain reconstruction, giving monotone behavior.
+
+---
+
 ## Experiment 14 — Per-row codebooks ← MAJOR BREAKTHROUGH
 
 **Question:** Does giving each output row its own independent k-means codebook eliminate
