@@ -2157,19 +2157,127 @@ quantization can be far more aggressive than uniform INT quantization for simila
 
 ---
 
+## Experiment 25 — Block dimension sweep (bd=4 vs bd=8)
+
+**Question:** Does bd=4 (double the blocks per row, smaller block vectors) dominate bd=8
+on the PPL/bpw Pareto frontier when both use act_cal?
+
+**Design:** `experiments/block_dim_allayer.py`. All 24 MLP layers, activation-calibrated,
+attention FP32. Sweep bd ∈ {4, 8} × K ∈ {8,16,32,64,128,256}, including matched-bpw
+pairs (same bits per weight at different bd) and matched-K pairs (same codebook size).
+
+| Config      |  bd |   K |   bpw |       PPL | vs FP32 |
+|:------------|----:|----:|------:|----------:|--------:|
+| bd=8  K=64  |   8 |  64 | 0.750 |   321.676 |  5.084× |
+| bd=4  K=8   |   4 |   8 | 0.750 | 10008.492 | 158.2×  |
+| bd=8  K=128 |   8 | 128 | 0.849 |    84.192 |  1.331× |
+| bd=8  K=256 |   8 | 256 | 0.912 |    67.095 |  1.060× |
+| bd=4  K=16  |   4 |  16 | 1.000 |  4367.465 |  69.0×  |
+| bd=4  K=32  |   4 |  32 | 1.250 |   483.730 |  7.645× |
+| bd=4  K=64  |   4 |  64 | 1.500 |   117.336 |  1.854× |
+| bd=4  K=128 |   4 | 128 | 1.750 |    74.153 |  1.172× |
+
+FP32 baseline: 63.278.
+
+**Key finding: bd=8 strictly dominates bd=4 on the PPL/bpw Pareto frontier.**
+
+At matched bpw (0.75): bd=8 K=64 PPL=321.7 vs bd=4 K=8 PPL=10,008 — 31× worse.
+bd=4 does not enter the ordered phase until K≥64 (1.5 bpw), where bd=8 K=64 (0.75 bpw)
+already gives much lower PPL at half the cost.
+
+**Phase transition is harder to escape at smaller block size:**
+- bd=8: phase transition at K≈56-64 (0.75 bpw). K=64 is just above the critical point.
+- bd=4: phase transition at K≈48-64 (1.5 bpw). K=32 gives PPL=483 (still chaotic);
+  K=64 gives PPL=117 (ordered). Critical bpw ≈ 1.5 for bd=4.
+
+The mechanism: smaller blocks (bd=4) are 4-dimensional vectors. The k-means energy
+landscape is smoother in lower dimensions, but the critical K is set by the number of
+blocks that need covering, not the dimensionality. With bd=4, each row has 2× more blocks,
+requiring proportionally larger K to adequately cover the block distribution — and since
+bpw = log2(K)/bd, the bpw cost doubles.
+
+**bd=8 with its K=64 phase transition at 0.75 bpw is the optimal block size.** It sits at
+the minimum viable K with minimum bpw overhead. Smaller blocks require more K and larger
+bpw for equivalent quality.
+
+Note: bd=4 K=128 (1.75 bpw) gives PPL=74.2, slightly better than bd=8 K=128 (0.849 bpw)
+PPL=84.2. At the same K, bd=4 is marginally better (lower-dimensional blocks are easier
+to cluster), but this requires 2× the bpw — not a Pareto improvement.
+
+---
+
+## Experiment 26 — Greedy bpw budget allocation
+
+**Question:** Does a greedy allocation algorithm (K ∈ {64,96,128,192,256,384} per layer,
+scored by Exp 18 sensitivity / delta_bpw) find a better Pareto frontier than the binary
+top-N (K∈{64,128}) scheme?
+
+**Design:** `experiments/budget_allocation.py`. Greedy algorithm:
+1. Start all 24 MLP layers at K=64 (0.75 bpw baseline)
+2. Score each possible upgrade (layer i, K_curr → K_next):
+   score = SENSITIVITY[i] / (log2(K_next_eff) - log2(K_curr)) / bd
+3. Pick highest-score upgrade fitting in remaining budget; repeat until exhausted
+4. Activation-calibrated build + eval at each budget point
+
+| budget | actual_bpw | greedy PPL | top-N PPL | delta |
+|-------:|----------:|----------:|----------:|------:|
+|  0.750 |     0.750 |   321.676 |   321.676 |  ±0   |
+|  0.769 |     0.769 |   239.303 |   217.041 | +22.3 |
+|  0.787 |     0.785 |   210.788 |   180.037 | +30.8 |
+|  0.804 |     0.804 |   179.878 |   146.579 | +33.3 |
+|  0.820 |     0.817 |   149.066 |   120.085 | +29.0 |
+|  0.836 |     0.834 |   138.035 |   120.085 | +18.0 |
+|  0.849 |     0.848 |   116.211 |    84.192 | +32.0 |
+|  0.875 |     0.873 |    96.569 |    84.192 | +12.4 |
+
+FP32 baseline: 63.278.
+
+**Key finding: greedy is worse than binary top-N at every bpw point (by 12–33 PPL).**
+
+The greedy algorithm concentrates bits on a few high-sensitivity layers (pushing h6.c_proj
+to K=384 early) while leaving many other layers at K=64. Example at budget=0.875:
+greedy gives K=384:8, K=96:5, K=64:11 — vs top-N giving K=128 to all 24 layers.
+
+**Why the greedy fails — the sensitivity proxy is not marginal:**
+The greedy reuses the same SENSITIVITY[i] (Exp 18 ΔPPL) for every upgrade step of layer i
+(K=64→96, K=96→128, K=128→192, ...). This treats all upgrade steps as equally valuable,
+ignoring diminishing returns. In practice:
+- K=64 → K=128 is the most impactful upgrade (largest marginal gain per bpw)
+- K=128 → K=384 has far smaller marginal gain, but the greedy overestimates it
+
+Because `score = sensitivity / delta_bpw`, a high-sensitivity layer gets higher scores for
+all its upgrades. The greedy keeps upgrading h6.c_proj (sensitivity=79.4) through K=96,
+K=128, K=192, K=256, K=384 before upgrading h5.c_proj at K=64 — even though the later
+steps are nearly worthless in practice.
+
+**The binary top-N scheme wins because it encodes the right inductive bias:** upgrade each
+layer exactly once (K=64→K=128), prioritized by sensitivity. This captures the dominant
+gain from the first upgrade step while spreading bits evenly across layers.
+
+**Conclusion:** The Exp 18 sensitivity scores are valid for ranking which layers should be
+upgraded first, but are not valid as marginal benefit proxies for multi-step upgrades.
+The binary K∈{64,128} top-N scheme is the correct way to use this information.
+
+---
+
 ## Future Work — Unexplored Avenues
 
 The following directions are identified but not yet implemented.
 
-### FW-1: Block dimension as a free variable (→ Exp 25)
+### FW-1: Block dimension as a free variable (→ Exp 25, COMPLETED — negative result)
 All post-Exp-16 work uses bd=8. bd=4 doubles n_blocks_per_row, giving k-means more data
 per row at the cost of higher bpw for the same K. The question is whether bd=4 dominates
 bd=8 on the PPL/bpw Pareto frontier when both use act_cal.
+**Result: bd=8 dominates. bd=4 requires K>=64 to escape the phase transition (1.5 bpw),
+making it strictly worse than bd=8 K=64 (0.75 bpw). See Exp 25.**
 
-### FW-2: Optimal bpw budget allocation (→ Exp 26)
+### FW-2: Optimal bpw budget allocation (→ Exp 26, COMPLETED — negative result)
 Exp 20B/21 use a binary K∈{64,128} top-N scheme. A greedy allocation algorithm with
 K ∈ {64,96,128,192,256,384} and Exp 18 sensitivity scores as proxies could find a
 better frontier than the hand-tuned top-N approach at any given bpw budget.
+**Result: greedy is 13-33 PPL worse than top-N at every bpw point. The Exp 18 sensitivity
+proxy overestimates marginal gains beyond K=128; the binary scheme's even distribution
+of K=128 across layers beats concentration of K=384 on few layers. See Exp 26.**
 
 ### FW-3: Embedding + lm_head quantization
 wte [50257×768] and wpe [1024×768] are untouched. In GPT-2, lm_head shares weights
