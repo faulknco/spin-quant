@@ -945,6 +945,66 @@ single-technique frontier in the bpw=0.77–0.83 range.
 
 ---
 
+## Experiment 24 — Full optimal model (capstone)
+
+**Question:** What is the best achievable full-model PPL/bpw frontier combining all
+findings: MLP top-N K128/K64 activation-calibrated + attention K=96 (lossless)?
+
+**Design:** `experiments/full_model_optimal.py`. For N=0,4,8,12,16,24:
+- MLP layers: top-N Exp-18 ΔPPL-ranked layers get K=128, rest get K=64, all activation-calibrated
+- Attention layers: K=96 (= n_blocks_per_row = 768//8 = 96), activation-calibrated
+
+| N  | mlp_bpw | attn_bpw | total_bpw |     PPL | vs FP32 | attn delta |
+|---:|--------:|---------:|----------:|--------:|--------:|-----------:|
+|  0 |   0.750 |    0.823 |     0.787 | 321.676 |  5.084× |     ±0.000 |
+|  4 |   0.769 |    0.823 |     0.796 | 217.041 |  3.430× |     ±0.000 |
+|  8 |   0.787 |    0.823 |     0.805 | 180.037 |  2.845× |     ±0.000 |
+| 12 |   0.804 |    0.823 |     0.813 | 146.579 |  2.316× |     ±0.000 |
+| 16 |   0.820 |    0.823 |     0.822 | 120.085 |  1.898× |     ±0.000 |
+| 24 |   0.849 |    0.823 |     0.836 |  84.192 |  1.331× |     ±0.000 |
+
+FP32 baseline: 63.278.
+
+**Key finding: attention K=96 is perfectly lossless at every N. Attn delta = 0 throughout.**
+
+The full-model PPL at every N is numerically identical to the MLP-only result from Exp 21
+(differences are floating-point rounding ≤0.001). Adding lossless attention quantization
+to 24 additional sublayers is completely free — it costs zero perplexity at any MLP config.
+
+**This confirms the generality of the K=96 losslessness discovered in Exp 22.** It holds
+not just for the N=0 (uniform K=64 MLP) case but across all non-uniform MLP configurations.
+The mechanism is purely geometric: K=96 = n_blocks_per_row for all attention layers, so
+every block gets its own centroid regardless of calibration or MLP configuration.
+
+**Definitive full-model Pareto frontier (all 48 sublayers quantized):**
+
+| N  | total_bpw |     PPL | vs FP32 | compression ratio |
+|---:|----------:|--------:|--------:|------------------:|
+|  0 |     0.787 | 321.676 |  5.084× |          ~13.3× FP32 bpw |
+|  4 |     0.796 | 217.041 |  3.430× |          ~13.2× |
+|  8 |     0.805 | 180.037 |  2.845× |          ~13.0× |
+| 12 |     0.813 | 146.579 |  2.316× |          ~12.9× |
+| 16 |     0.822 | 120.085 |  1.898× |          ~12.8× |
+| 24 |     0.836 |  84.192 |  1.331× |          ~12.5× |
+
+Compression ratio vs FP32 (32 bpw): approximately 32/total_bpw ≈ 12.5–13.3×.
+
+**Interpretation:** The full model at N=24 (all layers K=128, all calibrated, attn K=96)
+achieves PPL=84.2 at ~0.836 bpw — only 1.33× FP32 baseline at 38× parameter compression
+relative to FP32 bit count. At N=16 (bpw=0.822), PPL=120.1 — under 2× FP32.
+
+**Summary of the research trajectory:**
+Starting from flat k-means (single-layer PPL > 300 at bpw=0.5), each technique contributed:
+1. Per-row codebooks:       PPL 422 → 422 (Exp 17 baseline at 0.75 bpw)
+2. + Activation calibration: → 321.7 (−24%)
+3. + Non-uniform K (N=24):  → 84.2 (−74% from step 2)
+4. + Attention K=96:        → 84.2 (free, ±0)
+
+The dominant gains are from non-uniform K allocation and activation calibration. Lossless
+attention quantization adds no PPL cost but does compress 24 additional sublayers for free.
+
+---
+
 ## Experiment 23 — Gradient-sensitivity weighted per-row k-means
 
 **Question:** Does weighting k-means blocks by gradient sensitivity (`||∂L/∂h_i||²` per output
