@@ -945,6 +945,73 @@ single-technique frontier in the bpw=0.77–0.83 range.
 
 ---
 
+## Experiment 22 — Attention layer quantization
+
+**Question:** How does attention sublayer quantization (c_attn [2304×768], c_proj [768×768])
+compare to MLP quantization? Can calibrated attention quantization match or beat MLP-only?
+
+**Design:** `experiments/attention_quantization.py`. Six configs:
+1. `attn-only K64 uncal` — attention layers only (MLP at FP32)
+2. `attn-only K64 cal` — same + activation calibration
+3. `MLP K64cal + attn K64 uncal` — both quantized, attention uncalibrated
+4. `MLP K64cal + attn K64 cal` — both quantized + calibrated
+5. `MLP K64cal + attn K96 uncal` — attention at K=96
+6. `MLP K64cal + attn K96 cal` — attention at K=96 calibrated
+
+Attention layer geometry: in_features=768, bd=8 → n_blocks_per_row=96. So K=96 is exact
+reconstruction (every block gets its own centroid).
+
+| Config                     |      PPL | vs FP32 | vs MLP-only |
+|:---------------------------|--------:|--------:|------------:|
+| attn-only K64 uncal        |  125.065 |  1.976× |      0.389× |
+| attn-only K64 cal          |   82.941 |  1.311× |      0.258× |
+| MLP K64cal + attn K64 uncal | 1992.713 | 31.491× |      6.195× |
+| MLP K64cal + attn K64 cal  |  343.532 |  5.429× |      1.068× |
+| MLP K64cal + attn K96 uncal |  321.676 |  5.084× |      1.000× |
+| MLP K64cal + attn K96 cal  |  321.676 |  5.084× |      1.000× |
+
+FP32 baseline: 63.278. MLP-only K=64 cal reference: 321.676.
+
+**Key findings:**
+
+**1. Attention-only K64 calibrated achieves PPL=82.9 — better than MLP-only K=128 uncal (87.6).**
+Attention weights are individually more quantization-tolerant than MLP weights at K=64.
+Calibration provides a large absolute gain for attention (125 → 83, −34%).
+
+**2. MLP + attn K64 uncalibrated is catastrophic (PPL=1993, 31.5× FP32).**
+Combining two uncalibrated quantized subsystems causes destructive interference — errors
+from both compound without any calibration to align codebooks with activation distributions.
+
+**3. Calibration rescues combined quantization but not to MLP-only quality.**
+MLP K64cal + attn K64 cal gives PPL=343.5 vs MLP-only 321.7 (+6.8%). Calibration cannot
+fully recover from the joint quantization at K=64 — attention quantization costs ~22 PPL
+points even with calibration.
+
+**4. K=96 attention = lossless (exact reconstruction).**
+Since n_blocks_per_row=96 for all attention layers (in_features=768, bd=8), K=96 assigns
+one centroid per block → no information is lost. PPL=321.676 exactly matches MLP-only K=64
+cal in both uncalibrated and calibrated conditions. Attention can be quantized for free at
+K=96 with no PPL cost.
+
+**5. The attention quantization bottleneck is at K=64, not K=96.**
+K=96 is lossless; K=64 is lossy and costs ~22 PPL even with calibration. For practical
+full-model compression, attention layers should target K=96 (exact reconstruction at
+bpw=0.875) rather than K=64 (lossy even calibrated).
+
+**Attention layer compression summary:**
+
+| Mode | Attention bpw | PPL cost vs MLP-only |
+|:-----|:-------------:|--------------------:|
+| FP32 attention | — | 0 (reference) |
+| K=96 (lossless) | 0.875 | 0 |
+| K=64 calibrated | 0.750 | +22 (+6.8%) |
+| K=64 uncalibrated | 0.750 | +1671 (+520%) |
+
+**Recommendation:** Use K=96 for all attention layers (lossless at 0.875 bpw). K=64
+attention is viable only with calibration and incurs a measurable PPL penalty.
+
+---
+
 ## Experiment 20B — Top-N K128/K64 sweep (K=64 floor)
 
 **Question:** Given that non-uniform compression works when background stays at K=64
