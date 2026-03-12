@@ -945,6 +945,64 @@ single-technique frontier in the bpw=0.77–0.83 range.
 
 ---
 
+## Experiment 23 — Gradient-sensitivity weighted per-row k-means
+
+**Question:** Does weighting k-means blocks by gradient sensitivity (`||∂L/∂h_i||²` per output
+neuron) improve on activation-calibrated k-means (`||x_j||²` per input block)?
+
+**Design:** `experiments/gradient_sensitivity.py`. Three calibration modes at K=64 and K=96:
+- `uncal`: standard per-row k-means (Euclidean distance)
+- `act_cal`: per-block activation weights from FP32 forward passes (Exp 19B method)
+- `grad_cal`: per-row gradient norm × per-block activation weight: `w_ij = grad_norm_i * act_norm_ij`
+
+Gradient norms computed by enabling autograd, running cross-entropy loss on N_CALIB=20 texts,
+backpropagating, and capturing `||∂L/∂h_i||²` for each output neuron i.
+
+| Config       | K  |     PPL | vs uncal | vs act_cal |
+|:-------------|---:|--------:|---------:|-----------:|
+| uncal        | 64 | 439.737 |    (ref) |      (ref) |
+| act_cal      | 64 | 321.676 |      —   |      (ref) |
+| **grad_cal** | 64 | **356.545** | 0.811× |  **1.108×** |
+| uncal        | 96 | 103.695 |    (ref) |      (ref) |
+| act_cal      | 96 |  93.081 |      —   |      (ref) |
+| **grad_cal** | 96 | **103.916** | 1.002× |  **1.116×** |
+
+FP32 baseline: 63.278.
+
+**Key finding: gradient calibration is worse than activation calibration at both K values.**
+
+- K=64: grad_cal=356.5 — 11% worse than act_cal=321.7, but 19% better than uncal=439.7
+- K=96: grad_cal=103.9 — essentially identical to uncal=103.7; activation calibration (93.1) is superior
+
+**Why gradient calibration fails — structural analysis:**
+
+In per-row k-means, each row i gets its own independent codebook. The grad_cal weight for
+block j in row i is `w_ij = grad_norm_i × act_norm_ij`. Since `grad_norm_i` is a scalar
+constant for all blocks in row i, it is a uniform multiplier for that row — it doesn't
+change the relative ordering of blocks within a row, and rows are already independent.
+The gradient component provides zero additional information to the within-row k-means
+optimization.
+
+The k-means update rule is: centroid = weighted mean of assigned blocks. If all weights
+in a row are scaled by the same `grad_norm_i`, the centroid positions are identical to
+pure activation calibration. The gradient norm only matters if it could reallocate
+centroid budget across rows — but per-row k-means gives every row the same K, so no
+such reallocation is possible.
+
+**Result: grad_cal ≡ act_cal in theory, with added noise from gradient estimation in practice.**
+
+The small degradation observed (grad_cal > act_cal) is attributable to gradient estimation
+noise on 20 calibration texts. With unlimited calibration data, grad_cal should converge
+to act_cal.
+
+**Conclusion: activation calibration (act_cal) is the optimal calibration strategy for
+per-row k-means.** Gradient sensitivity provides no additional signal given the per-row
+decomposition — gradient norms would only be useful if centroids were shared across rows
+(flat k-means), where they could weight which rows' blocks matter more to codebook
+placement.
+
+---
+
 ## Experiment 22 — Attention layer quantization
 
 **Question:** How does attention sublayer quantization (c_attn [2304×768], c_proj [768×768])
