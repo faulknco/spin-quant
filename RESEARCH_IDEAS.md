@@ -103,10 +103,11 @@ The RG framing gives a principled reason and a systematic bit-allocation algorit
 | RG hierarchical | Medium | Done | ✅ |
 | **DCT (frequency domain)** | **Medium** | **Done** | **✅** |
 | **WHT (Hadamard)** | **Medium** | **Done** | **✅** |
+| **Per-row codebooks + act_cal** | **High** | **Done** | **✅ (Exp 14–26)** |
+| **RG flow across layers (non-uniform K)** | **Medium-High** | **Done** | **✅ (Exp 18–21)** |
+| Spin glass / Hessian-aware | High | High | Partially explored (Exp 4–5) |
 | Taylor/power series | Medium | Low | Proposed |
 | MPS decomposition | High | Medium | Proposed |
-| Spin glass / Hessian-aware | High | High | Proposed |
-| RG flow across layers | Medium-High | Low | Proposed |
 
 ---
 
