@@ -2154,3 +2154,37 @@ quantization can be far more aggressive than uniform INT quantization for simila
 - QuIP# (Hadamard incoherence): implied by QuIP# paper, Cornell/Meta 2024
 - Residual quantization with implicit neural codebooks: ai.meta.com/research/publications/...
 - Awesome-LLM-Quantization: github.com/pprp/Awesome-LLM-Quantization
+
+---
+
+## Future Work — Unexplored Avenues
+
+The following directions are identified but not yet implemented.
+
+### FW-1: Block dimension as a free variable (→ Exp 25)
+All post-Exp-16 work uses bd=8. bd=4 doubles n_blocks_per_row, giving k-means more data
+per row at the cost of higher bpw for the same K. The question is whether bd=4 dominates
+bd=8 on the PPL/bpw Pareto frontier when both use act_cal.
+
+### FW-2: Optimal bpw budget allocation (→ Exp 26)
+Exp 20B/21 use a binary K∈{64,128} top-N scheme. A greedy allocation algorithm with
+K ∈ {64,96,128,192,256,384} and Exp 18 sensitivity scores as proxies could find a
+better frontier than the hand-tuned top-N approach at any given bpw budget.
+
+### FW-3: Embedding + lm_head quantization
+wte [50257×768] and wpe [1024×768] are untouched. In GPT-2, lm_head shares weights
+with wte. These are lookup tables rather than linear transforms and may behave
+differently under per-row k-means.
+
+### FW-4: Cross-row shared codebooks with gradient weighting
+Exp 23 showed gradient norms are useless for per-row independent codebooks. If centroids
+are shared across rows within a layer (flat k-means over a full layer), per-row gradient
+norms become meaningful for weighting which rows' blocks matter more to centroid placement.
+
+### FW-5: Residual (multi-stage) quantization
+Quantize → compute residuals → quantize residuals → repeat. Each stage adds bpw but should
+improve the PPL/bpw curve. Related to RVQ (Residual Vector Quantization).
+
+### FW-6: Scale to GPT-2 medium/large
+All results are on GPT-2 small (117M, 12 layers). Key questions: does the K=64 phase
+transition hold at 345M? Does the Exp 18 sensitivity pattern generalize across depths?
